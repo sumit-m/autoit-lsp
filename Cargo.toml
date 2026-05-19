@@ -1,0 +1,27 @@
+[package]
+name = "autoit-lsp"
+version = "0.1.0"
+edition = "2024"
+description = "Language Server for AutoIt v3 — Au3Check diagnostics wrapper"
+license = "MIT"
+repository = "https://github.com/smadan/autoit-lsp"
+readme = "README.md"
+keywords = ["lsp", "autoit", "language-server"]
+categories = ["development-tools"]
+
+[dependencies]
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["full"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# Optimize for binary size since this ships as a downloaded artifact.
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
