@@ -11,7 +11,36 @@ Companion to the [zed-autoit](https://github.com/smadan/zed-autoit) Zed editor e
 ## Requirements
 
 - Windows (Au3Check is a Windows-only executable).
-- AutoIt v3 installed. Default path probed: `C:\Program Files (x86)\AutoIt3\Au3Check.exe`. Override via the LSP `initializationOptions.au3check_path` field.
+- AutoIt v3 installed.
+
+## Au3Check discovery
+
+The server probes for `Au3Check.exe` in this order:
+
+1. The `initializationOptions.au3checkPath` setting (if the client provides one).
+2. `HKLM\SOFTWARE\WOW6432Node\AutoIt v3\AutoIt\InstallDir` (where the standard AutoIt installer writes its location on 64-bit Windows).
+3. `HKLM\SOFTWARE\AutoIt v3\AutoIt\InstallDir` (32-bit Windows fallback).
+4. The canonical default install path: `C:\Program Files (x86)\AutoIt3\Au3Check.exe`.
+
+Users who installed AutoIt with the official MSI fall under (2) or (3) — no configuration needed. Users with a portable / unzipped AutoIt at a non-default location should set `au3checkPath` in their editor.
+
+In Zed, add this to your `%APPDATA%\Zed\settings.json` (or workspace `.zed/settings.json`):
+
+```json
+{
+  "lsp": {
+    "autoit-lsp": {
+      "settings": {
+        "au3checkPath": "D:\\Tools\\AutoIt3\\Au3Check.exe"
+      }
+    }
+  }
+}
+```
+
+The server also accepts the same payload via `initializationOptions` for LSP clients that forward init-time options — but the `settings` key above is the path that's been verified to work with current Zed.
+
+If `au3checkPath` is set but points to a file that doesn't exist, the server logs a warning and falls through to the registry / default discovery — so a stale setting doesn't break the LSP for users who later install AutoIt normally.
 
 ## Build
 
