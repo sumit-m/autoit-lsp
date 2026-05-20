@@ -2,7 +2,7 @@
 
 A Language Server Protocol implementation for [AutoIt v3](https://www.autoitscript.com/site/autoit/).
 
-Companion to the [zed-autoit](https://github.com/smadan/zed-autoit) Zed editor extension. The Zed extension launches `autoit-lsp` as its language server; users typing in `.au3` files get live diagnostics in their editor.
+Companion to the [zed-autoit](https://github.com/sumit-m/zed-autoit) Zed editor extension. The Zed extension launches `autoit-lsp` as its language server; users typing in `.au3` files get live diagnostics in their editor.
 
 ## Status
 
