@@ -6,7 +6,7 @@ Companion to the [zed-autoit](https://github.com/smadan/zed-autoit) Zed editor e
 
 ## Status
 
-**v0.2 — edit-time diagnostics.** The server wraps AutoIt's official linter, `Au3Check.exe`, and surfaces its output as LSP `textDocument/publishDiagnostics`. Diagnostics refresh on open, on save, and ~400ms after the user stops typing (the in-memory buffer is staged to a temp file so Au3Check can lint unsaved edits). No completion, hover, or go-to-definition yet — those are planned for v0.3+ as the tree-sitter parse tree gets wired in (see the zed-autoit repo's `PLAN.md` Phase 7 v0.3+ roadmap).
+**v0.2.1 — edit-time diagnostics with UX polish.** The server wraps AutoIt's official linter, `Au3Check.exe`, and surfaces its output as LSP `textDocument/publishDiagnostics`. Diagnostics refresh on open, on save, and after the user stops typing (configurable debounce, default 400ms; the in-memory buffer is staged to a temp file so Au3Check can lint unsaved edits). v0.2.1 polish: configurable `debounceMs`, instant feedback on the first edit after open/save, multi-character squiggle ranges via token-walk and message-based identifier lookup, content-hash caching skips redundant subprocess spawns. No completion, hover, or go-to-definition yet — those are planned for v0.3+ as the tree-sitter parse tree gets wired in (see the zed-autoit repo's `PLAN.md` Phase 7 v0.3+ roadmap).
 
 ## Requirements
 

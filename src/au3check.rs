@@ -5,7 +5,7 @@
 //! re-publish its errors/warnings as LSP diagnostics. Invocation form:
 //!
 //! ```text
-//! Au3Check.exe -q <script-path>
+//! Au3Check.exe -q [-I <path>...] <script-path>
 //! ```
 //!
 //! Output line format (per loganch/AutoIt-VSCode, MIT):
@@ -17,6 +17,15 @@
 //!
 //! Followed by a summary line: `0 error(s), 0 warning(s)` (or non-zero
 //! counts). We only parse the diagnostic lines; the summary is ignored.
+//!
+//! Flag semantics (see https://www.autoitscript.com/autoit3/scite/docs/SciTE4AutoIt3/au3check.html):
+//! - `-q`: quiet, suppress banner. Always passed.
+//! - `-I <path>`: extra include search dir. Set to the original
+//!   file's directory so quoted `#include "x.au3"` resolves from a
+//!   staged temp path.
+//!
+//! Other flags (`-w<n>`, `-d`) are *not* exposed by the LSP — see
+//! `PHASE7-REFINEMENTS.md` A2 for the history of that decision.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -24,6 +33,22 @@ use std::sync::LazyLock;
 use regex::Regex;
 use tokio::process::Command;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+
+/// Configuration for a single `run_au3check` invocation. Bundled into a
+/// struct rather than a long parameter list so future flag additions
+/// stay additive instead of rippling through callers.
+#[derive(Debug, Clone)]
+pub struct Au3CheckConfig<'a> {
+    /// The file Au3Check should lint (a staged temp file in our case).
+    pub target: &'a Path,
+    /// Extra directories searched after the script's own dir for
+    /// quoted `#include "x.au3"` resolution. Pass the original file's
+    /// directory so includes still resolve from a staged temp path.
+    pub include_dirs: &'a [&'a Path],
+    /// Process working directory. Set to the original file's dir as a
+    /// fallback for any cwd-relative behaviour in Au3Check.
+    pub cwd: Option<&'a Path>,
+}
 
 /// Discover the Au3Check.exe path.
 ///
@@ -73,31 +98,28 @@ fn install_dir_from_registry() -> Option<PathBuf> {
     None
 }
 
-/// Run Au3Check on `target` and return its captured stdout.
-///
-/// `-q` suppresses the banner. Each entry in `include_dirs` is passed
-/// as a separate `-I <path>` so quoted `#include "x.au3"` directives
-/// fall through to the original file's directory when we're linting a
-/// staged temp file. `cwd`, if provided, becomes the process working
-/// directory — set it to the original file's directory as a fallback
-/// for any cwd-relative resolution paths.
-///
-/// We don't pass `-d` (debug) or any `-w<n>` warning flags — defaults
-/// are good enough for v0.2. Future versions may surface these as LSP
-/// settings.
+/// Build the Au3Check argument list from a config. Extracted so unit
+/// tests can verify flag generation without spawning the actual
+/// process.
+fn build_args(config: &Au3CheckConfig<'_>) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    args.push("-q".into());
+    for dir in config.include_dirs {
+        args.push("-I".into());
+        args.push(dir.as_os_str().to_os_string());
+    }
+    args.push(config.target.as_os_str().to_os_string());
+    args
+}
+
+/// Run Au3Check with the given config and return its captured stdout.
 pub async fn run_au3check(
     au3check: &Path,
-    target: &Path,
-    include_dirs: &[&Path],
-    cwd: Option<&Path>,
+    config: Au3CheckConfig<'_>,
 ) -> std::io::Result<String> {
     let mut cmd = Command::new(au3check);
-    cmd.arg("-q");
-    for dir in include_dirs {
-        cmd.arg("-I").arg(dir);
-    }
-    cmd.arg(target);
-    if let Some(cwd) = cwd {
+    cmd.args(build_args(&config));
+    if let Some(cwd) = config.cwd {
         cmd.current_dir(cwd);
     }
     let output = cmd.output().await?;
@@ -107,13 +129,123 @@ pub async fn run_au3check(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Walk forward from `col0` in `line` while the byte is part of an
+/// identifier / sigil-prefixed name. Returns the end column (one past
+/// the last identifier byte).
+///
+/// Heuristic only — assumes the source is ASCII-clean. AutoIt files
+/// are conventionally ASCII or Windows-1252.
+///
+/// Returns `col0 + 1` if the position lands on a non-identifier
+/// character or past the line end.
+fn token_end_col(line: &str, col0: u32) -> u32 {
+    let bytes = line.as_bytes();
+    let start = col0 as usize;
+    if start >= bytes.len() {
+        return col0 + 1;
+    }
+    let mut end = start;
+    while end < bytes.len() {
+        let b = bytes[end];
+        let is_token =
+            b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'@' || b == b'.';
+        if !is_token {
+            break;
+        }
+        end += 1;
+    }
+    if end == start {
+        col0 + 1
+    } else {
+        end as u32
+    }
+}
+
+/// Extract a leading AutoIt identifier from the start of a diagnostic
+/// message. Au3Check messages commonly start with the offending name:
+///
+/// - `"ThisFunctionDoesNotExist(): undefined function."` → `Some("ThisFunctionDoesNotExist")`
+/// - `"$foo: possibly used before declaration."` → `Some("$foo")`
+/// - `"@MyMacro: unknown macro."` → `Some("@MyMacro")`
+/// - `"Statement cannot be just an expression."` → `Some("Statement")` (false positive; harmless — search won't find a useful match)
+/// - `"syntax error"` → `Some("syntax")` (likewise harmless)
+/// - `""` → `None`
+///
+/// Identifier shape: optional `$` or `@` sigil, then one alpha or `_`,
+/// then any number of alphanumerics or `_`. ASCII only.
+fn extract_leading_identifier(msg: &str) -> Option<&str> {
+    let bytes = msg.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut i = 0;
+    let first = bytes[0];
+    if first == b'$' || first == b'@' {
+        i = 1;
+        // The sigil alone isn't an identifier; need at least one
+        // alpha/underscore after it.
+        if i >= bytes.len() || !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            return None;
+        }
+    } else if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    Some(&msg[..i])
+}
+
+/// Compute the start/end column of the diagnostic range, in 0-based
+/// LSP column units. Three-tier fallback:
+///
+/// 1. Walk forward from `col0` across identifier characters. If the
+///    walk produces a multi-character range, use it (the diagnostic
+///    landed on an identifier — happy path).
+/// 2. Extract a leading identifier from the diagnostic message and
+///    locate it in the line. Use that range (catches Au3Check's
+///    habit of positioning some diagnostics past the offending
+///    token, like `undefined function.` after the closing paren).
+/// 3. Single character at `col0` (worst-case fallback — Au3Check
+///    reported a column we can't enrich).
+///
+/// Returns `(start_col, end_col)` so callers can build an LSP Range.
+fn diagnostic_range(line: &str, col0: u32, msg: &str) -> (u32, u32) {
+    // Try 1: forward walk from col0.
+    if (col0 as usize) < line.len() {
+        let end = token_end_col(line, col0);
+        if end > col0 + 1 {
+            return (col0, end);
+        }
+    }
+    // Try 2: message-based identifier lookup. Find the identifier
+    // anywhere in the line — use the first occurrence. (If the same
+    // name appears multiple times in one line, first match is the
+    // pragmatic choice; rare edge case where it matters.)
+    if let Some(id) = extract_leading_identifier(msg) {
+        if let Some(byte_start) = line.find(id) {
+            let start = byte_start as u32;
+            let end = start + id.len() as u32;
+            return (start, end);
+        }
+    }
+    // Try 3: single character at the reported column.
+    (col0, col0 + 1)
+}
+
 /// Parse Au3Check output into LSP diagnostics scoped to `target`.
 ///
-/// Au3Check emits diagnostics for `#include`d files too, with their own
-/// paths. We filter to only the file we asked about — Zed publishes
-/// diagnostics per-URI, and surfacing include-file errors against the
-/// current buffer's URI would put squigglies on the wrong lines.
-pub fn parse_diagnostics(output: &str, target: &Path) -> Vec<Diagnostic> {
+/// `source` is the text of the file being linted — used to size the
+/// diagnostic range to the offending token (instead of a single
+/// character). Pass `""` if source isn't available; the range falls
+/// back to the v0.1 single-character behaviour.
+///
+/// Au3Check emits diagnostics for `#include`d files too, with their
+/// own paths. We filter to only the file we asked about — Zed
+/// publishes diagnostics per-URI, and surfacing include-file errors
+/// against the current buffer's URI would put squigglies on the
+/// wrong lines.
+pub fn parse_diagnostics(output: &str, target: &Path, source: &str) -> Vec<Diagnostic> {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
         // The trailing `\r` from the source regex (loganch/AutoIt-VSCode)
         // isn't needed — `.lines()` strips line terminators for us.
@@ -124,6 +256,11 @@ pub fn parse_diagnostics(output: &str, target: &Path) -> Vec<Diagnostic> {
     });
 
     let target_str = target.to_string_lossy();
+    // Indexing into `source.lines()` is O(n) per call; build a vec
+    // once so 50 diagnostics in the same file don't trigger 50 full
+    // re-scans. Empty source produces an empty vec, which token_end_col
+    // handles by falling back to col0+1.
+    let source_lines: Vec<&str> = source.lines().collect();
     let mut diags = Vec::new();
     for line in output.lines() {
         let Some(caps) = RE.captures(line) else { continue };
@@ -140,6 +277,12 @@ pub fn parse_diagnostics(output: &str, target: &Path) -> Vec<Diagnostic> {
         let col: u32 = caps["col"].parse().unwrap_or(1);
         let line0 = row.saturating_sub(1);
         let col0 = col.saturating_sub(1);
+        let line_text = source_lines.get(line0 as usize).copied().unwrap_or("");
+        let (start_col, end_col) = if line_text.is_empty() {
+            (col0, col0 + 1)
+        } else {
+            diagnostic_range(line_text, col0, &caps["msg"])
+        };
         let severity = match &caps["sev"] {
             "error" => DiagnosticSeverity::ERROR,
             "warning" => DiagnosticSeverity::WARNING,
@@ -147,8 +290,8 @@ pub fn parse_diagnostics(output: &str, target: &Path) -> Vec<Diagnostic> {
         };
         diags.push(Diagnostic {
             range: Range {
-                start: Position { line: line0, character: col0 },
-                end: Position { line: line0, character: col0 + 1 },
+                start: Position { line: line0, character: start_col },
+                end: Position { line: line0, character: end_col },
             },
             severity: Some(severity),
             source: Some("Au3Check".into()),
@@ -172,11 +315,13 @@ mod tests {
         let out = r#""C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3"(72,37) : error: syntax error
 "C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3" - 1 error(s), 0 warning(s)
 "#;
-        let diags = parse_diagnostics(out, &target());
+        // Empty source → range falls back to single character (col+1).
+        let diags = parse_diagnostics(out, &target(), "");
         assert_eq!(diags.len(), 1);
         let d = &diags[0];
         assert_eq!(d.range.start.line, 71); // 72 - 1
         assert_eq!(d.range.start.character, 36); // 37 - 1
+        assert_eq!(d.range.end.character, 37); // col0+1 fallback
         assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(d.message, "syntax error");
         assert_eq!(d.source.as_deref(), Some("Au3Check"));
@@ -186,7 +331,7 @@ mod tests {
     fn parses_warning_line() {
         let out = r#""C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3"(10,5) : warning: $foo: possibly used before declaration.
 "#;
-        let diags = parse_diagnostics(out, &target());
+        let diags = parse_diagnostics(out, &target(), "");
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
         assert!(diags[0].message.contains("possibly used before declaration"));
@@ -198,7 +343,7 @@ mod tests {
 
 C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3 - 0 error(s), 0 warning(s)
 "#;
-        let diags = parse_diagnostics(out, &target());
+        let diags = parse_diagnostics(out, &target(), "");
         assert!(diags.is_empty());
     }
 
@@ -210,7 +355,7 @@ C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3 - 0 error(s), 0 warni
         let out = r#""C:\Users\UPN\Documents\claude\zed-autoit\samples\helpers.au3"(5,1) : error: missing EndFunc
 "C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3"(72,37) : error: syntax error
 "#;
-        let diags = parse_diagnostics(out, &target());
+        let diags = parse_diagnostics(out, &target(), "");
         assert_eq!(diags.len(), 1, "only the hello.au3 diagnostic should pass through");
         assert_eq!(diags[0].range.start.line, 71);
     }
@@ -222,7 +367,7 @@ C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3 - 0 error(s), 0 warni
         // we still want the diagnostic to publish.
         let out = r#""c:\users\upn\documents\claude\zed-autoit\samples\hello.au3"(1,1) : error: x
 "#;
-        let diags = parse_diagnostics(out, &target());
+        let diags = parse_diagnostics(out, &target(), "");
         assert_eq!(diags.len(), 1);
     }
 
@@ -232,7 +377,234 @@ C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3 - 0 error(s), 0 warni
 some other unrelated noise
 "C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3" - 1 error(s), 0 warning(s)
 "#;
-        let diags = parse_diagnostics(out, &target());
+        let diags = parse_diagnostics(out, &target(), "");
         assert!(diags.is_empty());
+    }
+
+    // -- A4: multi-character squiggle range --
+
+    #[test]
+    fn token_end_col_extends_across_identifier() {
+        // Line: `Local $foobar = 5`, diagnostic at col 7 ($)
+        let line = "Local $foobar = 5";
+        assert_eq!(token_end_col(line, 6), 13); // $foobar spans cols 6..13
+    }
+
+    #[test]
+    fn token_end_col_handles_at_macro() {
+        // Line: `ConsoleWrite(@CRLF)`, diagnostic at the @ macro
+        let line = "ConsoleWrite(@CRLF)";
+        assert_eq!(token_end_col(line, 13), 18); // @CRLF spans cols 13..18
+    }
+
+    #[test]
+    fn token_end_col_returns_single_char_on_punctuation() {
+        // Diagnostic lands on `(`, a non-identifier char.
+        let line = "Func Broken(";
+        assert_eq!(token_end_col(line, 11), 12); // just the `(`
+    }
+
+    #[test]
+    fn token_end_col_handles_past_eol() {
+        // Diagnostic position past the end of the line — fallback.
+        let line = "short";
+        assert_eq!(token_end_col(line, 100), 101);
+    }
+
+    #[test]
+    fn parse_diagnostics_uses_source_for_range() {
+        // Au3Check reports col=7 (1-based) — position of `$` in
+        // `Local $foobar = 5`. Forward walk picks up the full
+        // identifier.
+        let source = "Local $foobar = 5\n";
+        let out = format!(
+            "\"{}\"(1,7) : warning: $foobar: possibly used before declaration.\n",
+            target().to_string_lossy()
+        );
+        let diags = parse_diagnostics(&out, &target(), source);
+        assert_eq!(diags.len(), 1);
+        let d = &diags[0];
+        assert_eq!(d.range.start.character, 6); // 7 - 1 (where $foobar starts)
+        assert_eq!(d.range.end.character, 13); // walked to end of $foobar
+    }
+
+    #[test]
+    fn parse_diagnostics_falls_back_to_msg_identifier_at_eol() {
+        // The real-world failure: Au3Check positions "undefined
+        // function" diagnostics AFTER the closing paren, at EOL.
+        // Forward-walk bails out (1-char fallback); message-based
+        // lookup finds the function name in the line and uses it
+        // as the range instead.
+        let source = "ThisFunctionDoesNotExist(\"hello\")\n";
+        // Line length = 33; Au3Check reports col=34 (1-based, past EOL).
+        let out = format!(
+            "\"{}\"(1,34) : error: ThisFunctionDoesNotExist(): undefined function.\n",
+            target().to_string_lossy()
+        );
+        let diags = parse_diagnostics(&out, &target(), source);
+        assert_eq!(diags.len(), 1);
+        let d = &diags[0];
+        // Repositioned from col 33 to col 0 (start of identifier in
+        // the line). Range spans the full identifier.
+        assert_eq!(d.range.start.character, 0);
+        assert_eq!(d.range.end.character, 24); // len of "ThisFunctionDoesNotExist"
+    }
+
+    #[test]
+    fn parse_diagnostics_uses_msg_identifier_for_punctuation_col() {
+        // col0 lands on `(` (not an identifier char). Forward walk
+        // returns col+1 (1-char). Message starts with the function
+        // name, so we relocate to it.
+        let source = "foo()\n";
+        let out = format!(
+            "\"{}\"(1,4) : warning: foo: something.\n",
+            target().to_string_lossy()
+        );
+        let diags = parse_diagnostics(&out, &target(), source);
+        assert_eq!(diags.len(), 1);
+        let d = &diags[0];
+        // col 4 → col0 = 3 (the `(`). Forward walk: 1 char.
+        // Message lookup: "foo" found at col 0, length 3.
+        assert_eq!(d.range.start.character, 0);
+        assert_eq!(d.range.end.character, 3);
+    }
+
+    #[test]
+    fn parse_diagnostics_single_char_when_no_msg_match() {
+        // col0 on whitespace, message identifier not in line —
+        // worst-case fallback: single character at reported col.
+        let source = "    \n";
+        let out = format!(
+            "\"{}\"(1,1) : error: syntax error\n",
+            target().to_string_lossy()
+        );
+        let diags = parse_diagnostics(&out, &target(), source);
+        assert_eq!(diags.len(), 1);
+        let d = &diags[0];
+        // "syntax" is extracted from msg but won't be found in "    "
+        // → fall through to single char at col0=0.
+        assert_eq!(d.range.start.character, 0);
+        assert_eq!(d.range.end.character, 1);
+    }
+
+    // -- extract_leading_identifier behaviour --
+
+    #[test]
+    fn extract_leading_identifier_function() {
+        assert_eq!(
+            extract_leading_identifier("ThisFunctionDoesNotExist(): undefined function."),
+            Some("ThisFunctionDoesNotExist")
+        );
+    }
+
+    #[test]
+    fn extract_leading_identifier_variable() {
+        assert_eq!(
+            extract_leading_identifier("$foo: possibly used before declaration."),
+            Some("$foo")
+        );
+    }
+
+    #[test]
+    fn extract_leading_identifier_macro() {
+        assert_eq!(
+            extract_leading_identifier("@CRLF: something"),
+            Some("@CRLF")
+        );
+    }
+
+    #[test]
+    fn extract_leading_identifier_underscored() {
+        assert_eq!(
+            extract_leading_identifier("_GUICtrlListView_AddItem: argument count."),
+            Some("_GUICtrlListView_AddItem")
+        );
+    }
+
+    #[test]
+    fn extract_leading_identifier_returns_none_for_empty() {
+        assert!(extract_leading_identifier("").is_none());
+    }
+
+    #[test]
+    fn extract_leading_identifier_returns_none_for_punctuation_start() {
+        assert!(extract_leading_identifier(".something").is_none());
+        assert!(extract_leading_identifier("123abc").is_none());
+        assert!(extract_leading_identifier("$$invalid").is_none());
+    }
+
+    #[test]
+    fn extract_leading_identifier_lone_sigil_is_none() {
+        // `$` alone isn't a valid identifier.
+        assert!(extract_leading_identifier("$").is_none());
+        assert!(extract_leading_identifier("@").is_none());
+    }
+
+    // -- diagnostic_range integration --
+
+    #[test]
+    fn diagnostic_range_forward_walk_wins() {
+        // col0 on an identifier — forward walk finds multi-char range,
+        // message lookup not consulted.
+        let line = "Local $foobar = 5";
+        let (s, e) = diagnostic_range(line, 6, "irrelevant msg");
+        assert_eq!((s, e), (6, 13));
+    }
+
+    #[test]
+    fn diagnostic_range_msg_lookup_at_eol() {
+        let line = "ThisFunctionDoesNotExist(\"hello\")";
+        let (s, e) = diagnostic_range(
+            line,
+            33, // past EOL
+            "ThisFunctionDoesNotExist(): undefined function.",
+        );
+        assert_eq!((s, e), (0, 24));
+    }
+
+    #[test]
+    fn diagnostic_range_full_fallback() {
+        let line = "    ";
+        let (s, e) = diagnostic_range(line, 1, "no identifier here");
+        assert_eq!((s, e), (1, 2));
+    }
+
+    // -- A2: Au3Check flag generation --
+
+    #[test]
+    fn build_args_minimal() {
+        let target = PathBuf::from(r"C:\tmp\x.au3");
+        let cfg = Au3CheckConfig {
+            target: &target,
+            include_dirs: &[],
+            cwd: None,
+        };
+        let args = build_args(&cfg);
+        // -q, then target.
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "-q");
+        assert_eq!(args[1], target.as_os_str());
+    }
+
+    #[test]
+    fn build_args_with_include_dirs() {
+        let target = PathBuf::from(r"C:\tmp\x.au3");
+        let inc1 = PathBuf::from(r"C:\proj");
+        let inc2 = PathBuf::from(r"C:\lib");
+        let include_dirs: &[&Path] = &[&inc1, &inc2];
+        let cfg = Au3CheckConfig {
+            target: &target,
+            include_dirs,
+            cwd: None,
+        };
+        let args = build_args(&cfg);
+        // -q -I C:\proj -I C:\lib <target>
+        assert_eq!(args.len(), 6);
+        assert_eq!(args[0], "-q");
+        assert_eq!(args[1], "-I");
+        assert_eq!(args[2], inc1.as_os_str());
+        assert_eq!(args[3], "-I");
+        assert_eq!(args[4], inc2.as_os_str());
+        assert_eq!(args[5], target.as_os_str());
     }
 }

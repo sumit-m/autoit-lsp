@@ -1,16 +1,20 @@
 //! autoit-lsp — Language Server for AutoIt v3
 //!
-//! v0.2 wraps `Au3Check.exe` (AutoIt's official linter) and surfaces
-//! its output as LSP diagnostics. Diagnostics refresh on open, on
-//! save, and ~400ms after the user stops typing (temp-file staging
-//! lets us lint the in-memory buffer without writing the user's file
-//! to disk). Speaks LSP over stdio.
+//! v0.2 wrapped `Au3Check.exe` and added edit-time diagnostics
+//! (temp-file staging + 400ms debounce). v0.2.1 layers on
+//! configurability and polish: configurable debounce, Au3Check
+//! warning-level / debug flag settings, immediate lint on the first
+//! edit after open (no debounce wait), multi-character squiggle
+//! ranges via a token heuristic, and content-hash caching to skip
+//! redundant checks. Speaks LSP over stdio.
 
 mod au3check;
 mod staging;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -20,35 +24,65 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-/// How long the server waits after the last `didChange` before
-/// running Au3Check. Each new keystroke supersedes the in-flight
-/// timer (via the per-document version counter), so mid-word typing
-/// produces zero check runs.
-const DEBOUNCE_MS: u64 = 400;
+use au3check::Au3CheckConfig;
 
-/// LSP `initializationOptions` payload. The client (e.g. Zed) forwards
-/// `lsp.autoit-lsp.initialization_options` from settings.json verbatim.
-///
-/// Today there's a single field. Adding more later is additive — serde's
-/// default deserialization ignores unknown keys.
+/// Default debounce when `debounceMs` setting isn't provided.
+const DEFAULT_DEBOUNCE_MS: u64 = 400;
+
+/// Bounds on `debounceMs` setting. Lower than 50 produces near-no-op
+/// debouncing (each keystroke spawns a check); higher than 5000 makes
+/// the LSP feel broken.
+const MIN_DEBOUNCE_MS: u64 = 50;
+const MAX_DEBOUNCE_MS: u64 = 5000;
+
+/// LSP `initializationOptions` / `workspace/didChangeConfiguration`
+/// payload. Adding fields is additive — serde's default
+/// deserialization ignores unknown keys, so older clients that don't
+/// send a new field just get the default.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct InitializationOptions {
     /// Absolute path to `Au3Check.exe`. Used by portable / non-installer
-    /// AutoIt setups that aren't in the registry and aren't at the default
-    /// install path. If unset (or pointing to a non-existent file), the
-    /// server falls back to its registry-and-default discovery chain.
+    /// AutoIt setups that aren't in the registry and aren't at the
+    /// default install path. If unset (or pointing to a non-existent
+    /// file), the server falls back to its registry-and-default
+    /// discovery chain.
     au3check_path: Option<String>,
+    /// Milliseconds to wait after the last keystroke before re-linting.
+    /// Defaults to 400. Clamped to [50, 5000].
+    debounce_ms: Option<u64>,
 }
 
-/// In-memory state for one open document. We need the latest text so
-/// we can stage it to a temp file for Au3Check, and we need a version
-/// counter so debounced check tasks can detect that a newer edit has
-/// superseded them.
+/// Resolved server-wide settings. Populated from
+/// `InitializationOptions` at `initialize` and updated on
+/// `workspace/didChangeConfiguration`.
+#[derive(Debug, Default, Clone)]
+struct Settings {
+    /// Validated path to Au3Check.exe. `None` means use discovery.
+    au3check_path: Option<PathBuf>,
+    /// Validated debounce in ms. `None` means use `DEFAULT_DEBOUNCE_MS`.
+    debounce_ms: Option<u64>,
+}
+
+/// In-memory state for one open document.
 #[derive(Debug, Default)]
 struct DocState {
+    /// Current buffer text. Updated by `did_change` (FULL sync).
     text: String,
+    /// Monotonic counter, bumped on every edit and on `did_save`.
+    /// Debounced check tasks compare this against the version they
+    /// were spawned with and bail out if a newer edit superseded
+    /// them.
     version: u64,
+    /// A3 — true until the first `did_change` post-open / post-save.
+    /// When true, the change handler skips the debounce timer and
+    /// runs the check immediately for snappier first-keystroke
+    /// feedback.
+    first_edit_pending: bool,
+    /// A5 — hash of the buffer text most recently passed to
+    /// Au3Check. If a subsequent check's hash matches, we skip the
+    /// subprocess spawn entirely (no-op edit, save-on-idle, etc.).
+    last_checked_hash: Option<u64>,
 }
 
 /// All Backend state lives behind an `Arc` so we can hand cheap clones
@@ -58,14 +92,13 @@ struct DocState {
 #[derive(Debug)]
 struct Inner {
     client: Client,
-    /// Path to Au3Check.exe resolved at startup via the registry/default
-    /// chain. `None` means none of those probes hit a real file.
+    /// Path to Au3Check.exe resolved at startup via the registry /
+    /// default chain. `None` means none of those probes hit a real
+    /// file.
     au3check: Option<PathBuf>,
-    /// Override from the `au3checkPath` setting, populated on
-    /// `initialize` and on `didChangeConfiguration`. Takes priority
-    /// over `au3check` when set. `std::sync::RwLock` is fine here
-    /// because we never hold the lock across an await.
-    setting_override: RwLock<Option<PathBuf>>,
+    /// All server-wide settings. `std::sync::RwLock` is fine because
+    /// we never hold the lock across an await.
+    settings: RwLock<Settings>,
     /// Open documents, keyed by URI. Tokio RwLock because we *do*
     /// hold reads across await (publishing diagnostics while a check
     /// is in flight).
@@ -83,7 +116,7 @@ impl Backend {
             inner: Arc::new(Inner {
                 client,
                 au3check,
-                setting_override: RwLock::new(None),
+                settings: RwLock::new(Settings::default()),
                 docs: AsyncRwLock::new(HashMap::new()),
             }),
         }
@@ -92,54 +125,87 @@ impl Backend {
     /// Effective Au3Check path: setting override if present, otherwise
     /// the path discovered at startup.
     fn resolved_au3check(&self) -> Option<PathBuf> {
-        self.inner
-            .setting_override
-            .read()
-            .ok()
-            .and_then(|guard| guard.clone())
+        let settings = self.inner.settings.read().expect("lock not poisoned");
+        settings
+            .au3check_path
+            .clone()
             .or_else(|| self.inner.au3check.clone())
+    }
+
+    /// Effective debounce in milliseconds.
+    fn resolved_debounce_ms(&self) -> u64 {
+        self.inner
+            .settings
+            .read()
+            .expect("lock not poisoned")
+            .debounce_ms
+            .unwrap_or(DEFAULT_DEBOUNCE_MS)
     }
 
     /// Parse a settings payload (from `initializationOptions` at startup
     /// or from `workspace/didChangeConfiguration` later) and update the
-    /// override path accordingly. Tolerant of missing/wrong-shape input.
+    /// server-wide settings. Tolerant of missing/wrong-shape input:
+    /// parse errors are logged and leave settings untouched.
     fn apply_settings(&self, value: serde_json::Value, source: &'static str) {
-        match serde_json::from_value::<InitializationOptions>(value) {
-            Ok(opts) => match opts.au3check_path {
-                Some(raw) => {
-                    let candidate = PathBuf::from(&raw);
-                    if candidate.is_file() {
-                        tracing::info!(
-                            path = %candidate.display(),
-                            source,
-                            "au3checkPath override accepted"
-                        );
-                        *self.inner.setting_override.write().expect("lock not poisoned") =
-                            Some(candidate);
-                    } else {
-                        tracing::warn!(
-                            path = %raw,
-                            source,
-                            "au3checkPath setting points to a non-existent file — ignoring"
-                        );
-                        *self.inner.setting_override.write().expect("lock not poisoned") = None;
-                    }
-                }
-                None => {
-                    // Setting was sent but au3checkPath is absent — clear
-                    // any previous override so we fall back to discovery.
-                    *self.inner.setting_override.write().expect("lock not poisoned") = None;
-                }
-            },
+        let opts: InitializationOptions = match serde_json::from_value(value) {
+            Ok(o) => o,
             Err(e) => {
-                tracing::warn!(error = %e, source, "failed to parse settings");
+                tracing::warn!(error = %e, source, "failed to parse settings — keeping current values");
+                return;
             }
-        }
+        };
+
+        let mut settings = self.inner.settings.write().expect("lock not poisoned");
+
+        // Au3Check path with file-exists validation. Stale settings
+        // (non-existent file) are cleared rather than retained, so
+        // installing AutoIt later "just works" without reconfiguring.
+        settings.au3check_path = match opts.au3check_path {
+            Some(raw) => {
+                let candidate = PathBuf::from(&raw);
+                if candidate.is_file() {
+                    tracing::info!(
+                        path = %candidate.display(),
+                        source,
+                        "au3checkPath override accepted"
+                    );
+                    Some(candidate)
+                } else {
+                    tracing::warn!(
+                        path = %raw,
+                        source,
+                        "au3checkPath setting points to a non-existent file — ignoring"
+                    );
+                    None
+                }
+            }
+            None => None,
+        };
+
+        // Debounce: clamp to a sane range. Values outside [50, 5000]
+        // are accepted but warned, and the clamped value is what
+        // takes effect.
+        settings.debounce_ms = opts.debounce_ms.map(|ms| {
+            let clamped = ms.clamp(MIN_DEBOUNCE_MS, MAX_DEBOUNCE_MS);
+            if clamped != ms {
+                tracing::warn!(
+                    requested = ms,
+                    clamped,
+                    source,
+                    "debounceMs outside [{MIN_DEBOUNCE_MS}, {MAX_DEBOUNCE_MS}] — clamped"
+                );
+            } else {
+                tracing::info!(debounce_ms = ms, source, "debounceMs accepted");
+            }
+            clamped
+        });
+
     }
 
     /// Stage the given buffer to a temp file, run Au3Check, and publish
     /// diagnostics under the original URI. No-op if Au3Check isn't
-    /// available or the URI doesn't resolve to a local path.
+    /// available, the URI doesn't resolve to a local path, or the
+    /// content hash matches a previous successful check.
     async fn check_and_publish(&self, uri: Url, text: String) {
         let Some(au3check) = self.resolved_au3check() else {
             return;
@@ -149,6 +215,21 @@ impl Backend {
             return;
         };
 
+        // A5 — hash cache check before any expensive work.
+        let new_hash = hash_text(&text);
+        {
+            let docs = self.inner.docs.read().await;
+            if let Some(state) = docs.get(&uri) {
+                if state.last_checked_hash == Some(new_hash) {
+                    tracing::debug!(
+                        uri = %uri,
+                        "skipping check — content hash matches last lint"
+                    );
+                    return;
+                }
+            }
+        }
+
         let temp_path = match staging::stage_buffer(&uri, &text).await {
             Ok(p) => p,
             Err(e) => {
@@ -157,24 +238,35 @@ impl Backend {
             }
         };
 
-        let include_dirs = [original_dir.as_path()];
-        match au3check::run_au3check(
-            &au3check,
-            &temp_path,
-            &include_dirs,
-            Some(&original_dir),
-        )
-        .await
-        {
+        // Build the Au3Check config. Vec<&Path> instead of an array
+        // literal so lifetimes are obviously sound across the await.
+        let include_dirs: Vec<&Path> = vec![original_dir.as_path()];
+        let config = Au3CheckConfig {
+            target: &temp_path,
+            include_dirs: &include_dirs,
+            cwd: Some(&original_dir),
+        };
+
+        match au3check::run_au3check(&au3check, config).await {
             Ok(output) => {
-                // parse_diagnostics filters to the file we asked about
-                // (temp_path), so #include'd-file diagnostics get
-                // dropped as before. We publish under the original URI
-                // so Zed associates the squigglies with the user's
-                // buffer, not the temp file.
-                let diags = au3check::parse_diagnostics(&output, &temp_path);
+                // A4 — pass source text so parse_diagnostics can size
+                // each diagnostic range to its offending token. We
+                // also use this to filter out includes (target =
+                // temp_path; #include'd files have other paths).
+                let diags = au3check::parse_diagnostics(&output, &temp_path, &text);
                 tracing::debug!(uri = %uri, count = diags.len(), "publishing diagnostics");
-                self.inner.client.publish_diagnostics(uri, diags, None).await;
+                self.inner
+                    .client
+                    .publish_diagnostics(uri.clone(), diags, None)
+                    .await;
+
+                // A5 — only update the hash after a successful check.
+                // If Au3Check errored, leave the hash untouched so we
+                // retry next time the user edits.
+                let mut docs = self.inner.docs.write().await;
+                if let Some(state) = docs.get_mut(&uri) {
+                    state.last_checked_hash = Some(new_hash);
+                }
             }
             Err(e) => {
                 tracing::warn!(uri = %uri, error = %e, "Au3Check invocation failed");
@@ -199,6 +291,17 @@ impl Backend {
         self.check_and_publish(uri, text).await;
     }
 }
+
+/// DefaultHasher of the buffer text. We don't need cryptographic
+/// strength — only "did this exact text get linted already." Collisions
+/// (~1 in 2^64) would skip a lint where they shouldn't, which is
+/// recoverable via the next edit.
+fn hash_text(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
@@ -271,6 +374,8 @@ impl LanguageServer for Backend {
                 DocState {
                     text: text.clone(),
                     version: 0,
+                    first_edit_pending: true,
+                    last_checked_hash: None,
                 },
             );
         }
@@ -283,7 +388,7 @@ impl LanguageServer for Backend {
         // new text. If the client sent INCREMENTAL changes anyway
         // (shouldn't happen — we advertised FULL — but be defensive),
         // we take the last full-text replacement and ignore the rest.
-        let Some(text) = params
+        let Some(new_text) = params
             .content_changes
             .into_iter()
             .rev()
@@ -293,20 +398,34 @@ impl LanguageServer for Backend {
             return;
         };
 
-        let version = {
+        // A3 — capture the first-edit flag and clear it in one
+        // critical section, so we know whether to skip the debounce
+        // for this notification.
+        let (text_for_check, version, skip_debounce) = {
             let mut docs = self.inner.docs.write().await;
             let state = docs.entry(uri.clone()).or_default();
-            state.text = text;
+            state.text = new_text;
             state.version = state.version.wrapping_add(1);
-            state.version
+            let skip = state.first_edit_pending;
+            state.first_edit_pending = false;
+            (state.text.clone(), state.version, skip)
         };
 
-        // Spawn the debounce timer. Clones an Arc handle into the
-        // task so it can outlive this handler invocation.
+        if skip_debounce {
+            // Lint immediately — gives the user instant feedback on
+            // the very first keystroke after opening/saving, instead
+            // of making them wait `debounceMs` for the most attentive
+            // moment of editing.
+            tracing::debug!(uri = %uri, "first-edit-after-open: skipping debounce");
+            self.check_and_publish(uri, text_for_check).await;
+            return;
+        }
+
+        let debounce_ms = self.resolved_debounce_ms();
         let backend = self.clone();
         let uri_for_task = uri.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
+            tokio::time::sleep(Duration::from_millis(debounce_ms)).await;
             backend.check_after_debounce(uri_for_task, version).await;
         });
     }
@@ -317,19 +436,23 @@ impl LanguageServer for Backend {
         // from disk. By LSP protocol, didChange always precedes
         // didSave, so the docs map is current.
         let text = {
-            let docs = self.inner.docs.read().await;
-            docs.get(&uri).map(|s| s.text.clone())
+            let mut docs = self.inner.docs.write().await;
+            if let Some(state) = docs.get_mut(&uri) {
+                // Bump version so any in-flight debounced check sees
+                // it as superseded and bails out — we're about to
+                // publish a fresher result from this immediate
+                // save-triggered check.
+                state.version = state.version.wrapping_add(1);
+                // A3 — re-arm first-edit-pending so a save→resume-
+                // typing cycle gets the same instant-feedback
+                // behaviour as a fresh open.
+                state.first_edit_pending = true;
+                Some(state.text.clone())
+            } else {
+                None
+            }
         };
         if let Some(text) = text {
-            // Bump version so any in-flight debounced check sees it
-            // as superseded and bails out — we're about to publish a
-            // fresher result from this immediate save-triggered check.
-            {
-                let mut docs = self.inner.docs.write().await;
-                if let Some(state) = docs.get_mut(&uri) {
-                    state.version = state.version.wrapping_add(1);
-                }
-            }
             self.check_and_publish(uri, text).await;
         }
     }
@@ -356,9 +479,9 @@ impl LanguageServer for Backend {
     /// only need to write one settings.json entry.
     ///
     /// Zed nests its settings under the language-server id, so the
-    /// payload arrives as `{ "autoit-lsp": { "au3checkPath": "..." } }`.
-    /// We peel that layer if present, otherwise treat the value as the
-    /// settings object directly (some clients do).
+    /// payload arrives as `{ "autoit-lsp": { ... } }`. We peel that
+    /// layer if present, otherwise treat the value as the settings
+    /// object directly (some clients do).
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         tracing::info!(settings = ?params.settings, "didChangeConfiguration received");
         let value = match params.settings.get("autoit-lsp") {
@@ -405,21 +528,62 @@ mod tests {
     }
 
     #[test]
-    fn missing_setting_yields_none() {
+    fn parses_all_settings() {
+        let json = serde_json::json!({
+            "au3checkPath": "C:/x.exe",
+            "debounceMs": 250
+        });
+        let opts: InitializationOptions = serde_json::from_value(json).unwrap();
+        assert_eq!(opts.au3check_path.as_deref(), Some("C:/x.exe"));
+        assert_eq!(opts.debounce_ms, Some(250));
+    }
+
+    #[test]
+    fn missing_settings_yield_defaults() {
         let opts: InitializationOptions =
             serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(opts.au3check_path.is_none());
+        assert!(opts.debounce_ms.is_none());
     }
 
     #[test]
     fn unknown_fields_dont_break_parse() {
         // Tolerant of extra keys — future versions may add settings and
         // older servers should still parse the payload without erroring.
+        // Also catches removed v0.2.1-dev names (au3checkParams etc.) —
+        // they're just unknown-and-ignored now.
         let json = serde_json::json!({
             "au3checkPath": "C:/x.exe",
-            "futureUnknownSetting": 42
+            "futureUnknownSetting": 42,
+            "au3checkParams": { "warningLevels": "1 2 3" }
         });
         let opts: InitializationOptions = serde_json::from_value(json).unwrap();
         assert_eq!(opts.au3check_path.as_deref(), Some("C:/x.exe"));
+    }
+
+    // The clamp / validation logic lives in `apply_settings`, which
+    // needs a Backend (and thus a Client). Verifying the clamp at the
+    // pure-arithmetic layer instead — same logic, no LSP plumbing.
+
+    #[test]
+    fn debounce_clamp_low() {
+        assert_eq!(10_u64.clamp(MIN_DEBOUNCE_MS, MAX_DEBOUNCE_MS), 50);
+    }
+
+    #[test]
+    fn debounce_clamp_high() {
+        assert_eq!(99999_u64.clamp(MIN_DEBOUNCE_MS, MAX_DEBOUNCE_MS), 5000);
+    }
+
+    #[test]
+    fn debounce_clamp_in_range() {
+        assert_eq!(250_u64.clamp(MIN_DEBOUNCE_MS, MAX_DEBOUNCE_MS), 250);
+    }
+
+    #[test]
+    fn hash_text_is_stable_and_different_for_different_input() {
+        assert_eq!(hash_text("abc"), hash_text("abc"));
+        assert_ne!(hash_text("abc"), hash_text("abcd"));
+        assert_ne!(hash_text("abc"), hash_text(""));
     }
 }
