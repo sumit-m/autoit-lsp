@@ -307,13 +307,16 @@ mod tests {
     use super::*;
 
     fn target() -> PathBuf {
-        PathBuf::from(r"C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3")
+        // Neutral fixture path — these tests parse synthetic Au3Check
+        // output, they don't actually invoke the linter. Path matters
+        // only for the case-insensitive match check below.
+        PathBuf::from(r"C:\test\sample.au3")
     }
 
     #[test]
     fn parses_error_line() {
-        let out = r#""C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3"(72,37) : error: syntax error
-"C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3" - 1 error(s), 0 warning(s)
+        let out = r#""C:\test\sample.au3"(72,37) : error: syntax error
+"C:\test\sample.au3" - 1 error(s), 0 warning(s)
 "#;
         // Empty source → range falls back to single character (col+1).
         let diags = parse_diagnostics(out, &target(), "");
@@ -329,7 +332,7 @@ mod tests {
 
     #[test]
     fn parses_warning_line() {
-        let out = r#""C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3"(10,5) : warning: $foo: possibly used before declaration.
+        let out = r#""C:\test\sample.au3"(10,5) : warning: $foo: possibly used before declaration.
 "#;
         let diags = parse_diagnostics(out, &target(), "");
         assert_eq!(diags.len(), 1);
@@ -341,7 +344,7 @@ mod tests {
     fn clean_file_produces_no_diagnostics() {
         let out = r#"AutoIt3 Syntax Checker v3.3.18.0  Copyright (c) 2007-2025 Tylo & AutoIt Team
 
-C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3 - 0 error(s), 0 warning(s)
+C:\test\sample.au3 - 0 error(s), 0 warning(s)
 "#;
         let diags = parse_diagnostics(out, &target(), "");
         assert!(diags.is_empty());
@@ -352,11 +355,11 @@ C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3 - 0 error(s), 0 warni
         // Au3Check reports errors from #include'd files with the included
         // file's path. We only want diagnostics for the file we asked
         // about — otherwise squigglies land on the wrong buffer.
-        let out = r#""C:\Users\UPN\Documents\claude\zed-autoit\samples\helpers.au3"(5,1) : error: missing EndFunc
-"C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3"(72,37) : error: syntax error
+        let out = r#""C:\test\helpers.au3"(5,1) : error: missing EndFunc
+"C:\test\sample.au3"(72,37) : error: syntax error
 "#;
         let diags = parse_diagnostics(out, &target(), "");
-        assert_eq!(diags.len(), 1, "only the hello.au3 diagnostic should pass through");
+        assert_eq!(diags.len(), 1, "only the sample.au3 diagnostic should pass through");
         assert_eq!(diags[0].range.start.line, 71);
     }
 
@@ -365,7 +368,7 @@ C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3 - 0 error(s), 0 warni
         // Windows paths are case-insensitive. If the buffer URI lowercases
         // a path that Au3Check echoes back in mixed case (or vice versa),
         // we still want the diagnostic to publish.
-        let out = r#""c:\users\upn\documents\claude\zed-autoit\samples\hello.au3"(1,1) : error: x
+        let out = r#""c:\test\sample.au3"(1,1) : error: x
 "#;
         let diags = parse_diagnostics(out, &target(), "");
         assert_eq!(diags.len(), 1);
@@ -375,7 +378,7 @@ C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3 - 0 error(s), 0 warni
     fn ignores_summary_and_banner_lines() {
         let out = r#"AutoIt3 Syntax Checker v3.3.18.0
 some other unrelated noise
-"C:\Users\UPN\Documents\claude\zed-autoit\samples\hello.au3" - 1 error(s), 0 warning(s)
+"C:\test\sample.au3" - 1 error(s), 0 warning(s)
 "#;
         let diags = parse_diagnostics(out, &target(), "");
         assert!(diags.is_empty());
