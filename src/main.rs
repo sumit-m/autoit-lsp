@@ -1,17 +1,30 @@
 //! autoit-lsp — Language Server for AutoIt v3
 //!
-//! v0.1 wraps `Au3Check.exe` (AutoIt's official linter) and surfaces its
-//! output as LSP diagnostics. Speaks LSP over stdio.
+//! v0.2 wraps `Au3Check.exe` (AutoIt's official linter) and surfaces
+//! its output as LSP diagnostics. Diagnostics refresh on open, on
+//! save, and ~400ms after the user stops typing (temp-file staging
+//! lets us lint the in-memory buffer without writing the user's file
+//! to disk). Speaks LSP over stdio.
 
 mod au3check;
+mod staging;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use serde::Deserialize;
+use tokio::sync::RwLock as AsyncRwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+
+/// How long the server waits after the last `didChange` before
+/// running Au3Check. Each new keystroke supersedes the in-flight
+/// timer (via the per-document version counter), so mid-word typing
+/// produces zero check runs.
+const DEBOUNCE_MS: u64 = 400;
 
 /// LSP `initializationOptions` payload. The client (e.g. Zed) forwards
 /// `lsp.autoit-lsp.initialization_options` from settings.json verbatim.
@@ -28,27 +41,63 @@ struct InitializationOptions {
     au3check_path: Option<String>,
 }
 
+/// In-memory state for one open document. We need the latest text so
+/// we can stage it to a temp file for Au3Check, and we need a version
+/// counter so debounced check tasks can detect that a newer edit has
+/// superseded them.
+#[derive(Debug, Default)]
+struct DocState {
+    text: String,
+    version: u64,
+}
+
+/// All Backend state lives behind an `Arc` so we can hand cheap clones
+/// to spawned debounce tasks. `tower-lsp` gives handlers `&self`, but
+/// the debounce timer fires from a `tokio::spawn` that outlives the
+/// handler call — that future has to own its references.
 #[derive(Debug)]
-struct Backend {
+struct Inner {
     client: Client,
     /// Path to Au3Check.exe resolved at startup via the registry/default
     /// chain. `None` means none of those probes hit a real file.
     au3check: Option<PathBuf>,
-    /// Override from `initializationOptions.au3checkPath`, populated on
-    /// `initialize`. Takes priority over `au3check` when set. RwLock so
-    /// the LSP trait's `&self` handlers can write it (interior mut).
+    /// Override from the `au3checkPath` setting, populated on
+    /// `initialize` and on `didChangeConfiguration`. Takes priority
+    /// over `au3check` when set. `std::sync::RwLock` is fine here
+    /// because we never hold the lock across an await.
     setting_override: RwLock<Option<PathBuf>>,
+    /// Open documents, keyed by URI. Tokio RwLock because we *do*
+    /// hold reads across await (publishing diagnostics while a check
+    /// is in flight).
+    docs: AsyncRwLock<HashMap<Url, DocState>>,
+}
+
+#[derive(Debug, Clone)]
+struct Backend {
+    inner: Arc<Inner>,
 }
 
 impl Backend {
+    fn new(client: Client, au3check: Option<PathBuf>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                client,
+                au3check,
+                setting_override: RwLock::new(None),
+                docs: AsyncRwLock::new(HashMap::new()),
+            }),
+        }
+    }
+
     /// Effective Au3Check path: setting override if present, otherwise
     /// the path discovered at startup.
     fn resolved_au3check(&self) -> Option<PathBuf> {
-        self.setting_override
+        self.inner
+            .setting_override
             .read()
             .ok()
             .and_then(|guard| guard.clone())
-            .or_else(|| self.au3check.clone())
+            .or_else(|| self.inner.au3check.clone())
     }
 
     /// Parse a settings payload (from `initializationOptions` at startup
@@ -65,7 +114,7 @@ impl Backend {
                             source,
                             "au3checkPath override accepted"
                         );
-                        *self.setting_override.write().expect("lock not poisoned") =
+                        *self.inner.setting_override.write().expect("lock not poisoned") =
                             Some(candidate);
                     } else {
                         tracing::warn!(
@@ -73,13 +122,13 @@ impl Backend {
                             source,
                             "au3checkPath setting points to a non-existent file — ignoring"
                         );
-                        *self.setting_override.write().expect("lock not poisoned") = None;
+                        *self.inner.setting_override.write().expect("lock not poisoned") = None;
                     }
                 }
                 None => {
                     // Setting was sent but au3checkPath is absent — clear
                     // any previous override so we fall back to discovery.
-                    *self.setting_override.write().expect("lock not poisoned") = None;
+                    *self.inner.setting_override.write().expect("lock not poisoned") = None;
                 }
             },
             Err(e) => {
@@ -88,27 +137,66 @@ impl Backend {
         }
     }
 
-    /// Run Au3Check against the URI's file path and publish diagnostics
-    /// back to the client. No-op if Au3Check isn't available or the URI
-    /// can't be resolved to a local path.
-    async fn check_and_publish(&self, uri: Url) {
+    /// Stage the given buffer to a temp file, run Au3Check, and publish
+    /// diagnostics under the original URI. No-op if Au3Check isn't
+    /// available or the URI doesn't resolve to a local path.
+    async fn check_and_publish(&self, uri: Url, text: String) {
         let Some(au3check) = self.resolved_au3check() else {
             return;
         };
-        let Ok(path) = uri.to_file_path() else {
+        let Some(original_dir) = staging::original_dir(&uri) else {
             tracing::debug!(uri = %uri, "ignoring non-file URI");
             return;
         };
-        match au3check::run_au3check(&au3check, &path).await {
+
+        let temp_path = match staging::stage_buffer(&uri, &text).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(uri = %uri, error = %e, "failed to stage buffer");
+                return;
+            }
+        };
+
+        let include_dirs = [original_dir.as_path()];
+        match au3check::run_au3check(
+            &au3check,
+            &temp_path,
+            &include_dirs,
+            Some(&original_dir),
+        )
+        .await
+        {
             Ok(output) => {
-                let diags = au3check::parse_diagnostics(&output, &path);
+                // parse_diagnostics filters to the file we asked about
+                // (temp_path), so #include'd-file diagnostics get
+                // dropped as before. We publish under the original URI
+                // so Zed associates the squigglies with the user's
+                // buffer, not the temp file.
+                let diags = au3check::parse_diagnostics(&output, &temp_path);
                 tracing::debug!(uri = %uri, count = diags.len(), "publishing diagnostics");
-                self.client.publish_diagnostics(uri, diags, None).await;
+                self.inner.client.publish_diagnostics(uri, diags, None).await;
             }
             Err(e) => {
                 tracing::warn!(uri = %uri, error = %e, "Au3Check invocation failed");
             }
         }
+    }
+
+    /// After the debounce delay, run a check only if no newer edit
+    /// has bumped the version. Late-fired timers from superseded
+    /// edits become no-ops here.
+    async fn check_after_debounce(&self, uri: Url, expected_version: u64) {
+        let (text, current_version) = {
+            let docs = self.inner.docs.read().await;
+            match docs.get(&uri) {
+                Some(state) => (state.text.clone(), state.version),
+                None => return,
+            }
+        };
+        if current_version != expected_version {
+            return;
+        }
+        self.check_and_publish(uri, text).await;
     }
 }
 
@@ -133,14 +221,16 @@ impl LanguageServer for Backend {
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             }),
             capabilities: ServerCapabilities {
-                // openClose + save drive our diagnostic refresh. `change` is
-                // NONE for v0.1 because Au3Check needs a file on disk and
-                // re-linting unsaved buffers requires temp-file staging
-                // (v0.2 work).
+                // FULL sync: each didChange carries the entire buffer
+                // text. Au3Check needs to be invoked against full source
+                // anyway (we stage to a temp file every check), so the
+                // efficiency gain from INCREMENTAL doesn't apply. When
+                // Sprint 1 adds tree-sitter incremental reparse, this
+                // will likely switch to INCREMENTAL.
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::NONE),
+                        change: Some(TextDocumentSyncKind::FULL),
                         save: Some(TextDocumentSyncSaveOptions::Supported(true)),
                         ..Default::default()
                     },
@@ -164,15 +254,100 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        // Best-effort sweep of the staging root. If the process is
+        // killed before this runs, %TEMP% gets cleaned by Windows
+        // eventually, so a leak isn't catastrophic.
+        staging::cleanup_all().await;
         Ok(())
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.check_and_publish(params.text_document.uri).await;
+        let uri = params.text_document.uri;
+        let text = params.text_document.text;
+        {
+            let mut docs = self.inner.docs.write().await;
+            docs.insert(
+                uri.clone(),
+                DocState {
+                    text: text.clone(),
+                    version: 0,
+                },
+            );
+        }
+        self.check_and_publish(uri, text).await;
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri;
+        // FULL sync means a single change event carries the entire
+        // new text. If the client sent INCREMENTAL changes anyway
+        // (shouldn't happen — we advertised FULL — but be defensive),
+        // we take the last full-text replacement and ignore the rest.
+        let Some(text) = params
+            .content_changes
+            .into_iter()
+            .rev()
+            .find_map(|c| if c.range.is_none() { Some(c.text) } else { None })
+        else {
+            tracing::debug!(uri = %uri, "ignoring didChange with no full-text replacement");
+            return;
+        };
+
+        let version = {
+            let mut docs = self.inner.docs.write().await;
+            let state = docs.entry(uri.clone()).or_default();
+            state.text = text;
+            state.version = state.version.wrapping_add(1);
+            state.version
+        };
+
+        // Spawn the debounce timer. Clones an Arc handle into the
+        // task so it can outlive this handler invocation.
+        let backend = self.clone();
+        let uri_for_task = uri.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
+            backend.check_after_debounce(uri_for_task, version).await;
+        });
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        self.check_and_publish(params.text_document.uri).await;
+        let uri = params.text_document.uri;
+        // Pull the latest in-memory buffer rather than re-reading
+        // from disk. By LSP protocol, didChange always precedes
+        // didSave, so the docs map is current.
+        let text = {
+            let docs = self.inner.docs.read().await;
+            docs.get(&uri).map(|s| s.text.clone())
+        };
+        if let Some(text) = text {
+            // Bump version so any in-flight debounced check sees it
+            // as superseded and bails out — we're about to publish a
+            // fresher result from this immediate save-triggered check.
+            {
+                let mut docs = self.inner.docs.write().await;
+                if let Some(state) = docs.get_mut(&uri) {
+                    state.version = state.version.wrapping_add(1);
+                }
+            }
+            self.check_and_publish(uri, text).await;
+        }
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = params.text_document.uri;
+        {
+            let mut docs = self.inner.docs.write().await;
+            docs.remove(&uri);
+        }
+        staging::cleanup_doc(&uri).await;
+        // Clear any lingering diagnostics from the client's UI.
+        // Without this, problems-panel entries for the closed file
+        // would persist until the next session.
+        self.inner
+            .client
+            .publish_diagnostics(uri, vec![], None)
+            .await;
     }
 
     /// LSP clients (notably Zed) often deliver settings through this
@@ -211,11 +386,7 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| Backend {
-        client,
-        au3check,
-        setting_override: RwLock::new(None),
-    });
+    let (service, socket) = LspService::new(|client| Backend::new(client, au3check));
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 

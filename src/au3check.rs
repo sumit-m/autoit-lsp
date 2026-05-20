@@ -32,8 +32,9 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 /// on 64-bit Windows; HKLM\SOFTWARE\AutoIt v3\AutoIt on 32-bit), then
 /// falls back to the canonical default path. Returns `None` only if
 /// the binary isn't at any of those locations — typically a portable
-/// install at a custom path. v0.2 will add an LSP-level
-/// `initializationOptions.au3checkPath` setting for that case.
+/// install at a custom path. In that case the user sets the
+/// `au3checkPath` LSP setting (handled in `main.rs`), which overrides
+/// whatever this function returns.
 pub fn discover_au3check() -> Option<PathBuf> {
     if let Some(dir) = install_dir_from_registry() {
         let candidate = dir.join("Au3Check.exe");
@@ -74,15 +75,32 @@ fn install_dir_from_registry() -> Option<PathBuf> {
 
 /// Run Au3Check on `target` and return its captured stdout.
 ///
-/// `-q` suppresses the banner. We don't pass `-d` (debug) or any `-w<n>`
-/// warning flags — defaults are good enough for v0.1. Future versions
-/// may surface these as LSP settings.
-pub async fn run_au3check(au3check: &Path, target: &Path) -> std::io::Result<String> {
-    let output = Command::new(au3check)
-        .arg("-q")
-        .arg(target)
-        .output()
-        .await?;
+/// `-q` suppresses the banner. Each entry in `include_dirs` is passed
+/// as a separate `-I <path>` so quoted `#include "x.au3"` directives
+/// fall through to the original file's directory when we're linting a
+/// staged temp file. `cwd`, if provided, becomes the process working
+/// directory — set it to the original file's directory as a fallback
+/// for any cwd-relative resolution paths.
+///
+/// We don't pass `-d` (debug) or any `-w<n>` warning flags — defaults
+/// are good enough for v0.2. Future versions may surface these as LSP
+/// settings.
+pub async fn run_au3check(
+    au3check: &Path,
+    target: &Path,
+    include_dirs: &[&Path],
+    cwd: Option<&Path>,
+) -> std::io::Result<String> {
+    let mut cmd = Command::new(au3check);
+    cmd.arg("-q");
+    for dir in include_dirs {
+        cmd.arg("-I").arg(dir);
+    }
+    cmd.arg(target);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    let output = cmd.output().await?;
     // Au3Check writes diagnostics to stdout; stderr is usually empty.
     // Use lossy decode — script paths can contain non-UTF8 bytes on
     // Windows codepages but our parser only cares about the ASCII parts.
