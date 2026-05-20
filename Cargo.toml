@@ -21,9 +21,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Windows registry lookup for Au3Check.exe discovery (mirrors the
 # tasks.json approach in the zed-autoit extension — same HKLM lookup
-# chain with hardcoded fallback). Compiles cleanly under the MSVC
-# toolchain; the earlier session's GNU/dlltool/zigbuild dead-end is
-# documented in zed-autoit/CLAUDE.md.
+# chain with hardcoded fallback). Use the MSVC toolchain on Windows;
+# the GNU toolchain has dlltool issues that don't link tokio cleanly.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 
