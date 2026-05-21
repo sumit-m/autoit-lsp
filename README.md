@@ -13,7 +13,7 @@ Companion to the [zed-autoit](https://github.com/sumit-m/zed-autoit) Zed editor 
 
 Au3Check diagnostics from v0.2.1 still work the same way — refresh on open, save, and after the user stops typing (configurable debounce, default 400ms; in-memory buffer is staged to a temp file so Au3Check can lint unsaved edits).
 
-Still planned for v0.4: completion (scope-aware), go-to-definition, find-references, cross-file `#include` resolution. See `zed-autoit/PLAN.md` Phase 7 for the full roadmap.
+Still planned: completion (scope-aware), go-to-definition, find-references, cross-file `#include` resolution.
 
 ## Requirements
 

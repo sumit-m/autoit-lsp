@@ -24,8 +24,9 @@
 //!   file's directory so quoted `#include "x.au3"` resolves from a
 //!   staged temp path.
 //!
-//! Other flags (`-w<n>`, `-d`) are *not* exposed by the LSP — see
-//! `PHASE7-REFINEMENTS.md` A2 for the history of that decision.
+//! Other flags (`-w<n>`, `-d`) are *not* exposed by the LSP because
+//! SciTE already configures them and adding a layered LSP setting
+//! didn't justify the UX cost.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
