@@ -1,1 +1,7 @@
 /target
+
+# Local Cargo config — used during the Phase 8 pre-Bundle-1 window to
+# patch the public `tree-sitter-autoit` git URL (committed in Cargo.toml)
+# to the sibling local path so `cargo build` works before the grammar
+# repo is pushed publicly. Optional after Bundle 1.
+/.cargo/config.toml

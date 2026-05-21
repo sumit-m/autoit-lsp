@@ -222,8 +222,15 @@ fn diagnostic_range(line: &str, col0: u32, msg: &str) -> (u32, u32) {
     // anywhere in the line — use the first occurrence. (If the same
     // name appears multiple times in one line, first match is the
     // pragmatic choice; rare edge case where it matters.)
+    //
+    // Case-insensitive: AutoIt identifiers are case-insensitive, and
+    // Au3Check normalises function names to their canonical casing in
+    // diagnostic messages (e.g. emits `FileOpen` even when the source
+    // says `fileopen`). A case-sensitive `str::find` would miss the
+    // off-case spelling and fall to the single-char tier — that's
+    // visible as a squiggle on the `)` instead of the function name.
     if let Some(id) = extract_leading_identifier(msg) {
-        if let Some(byte_start) = line.find(id) {
+        if let Some(byte_start) = find_ascii_case_insensitive(line, id) {
             let start = byte_start as u32;
             let end = start + id.len() as u32;
             return (start, end);
@@ -231,6 +238,29 @@ fn diagnostic_range(line: &str, col0: u32, msg: &str) -> (u32, u32) {
     }
     // Try 3: single character at the reported column.
     (col0, col0 + 1)
+}
+
+/// Find the first occurrence of `needle` in `haystack`, comparing
+/// case-insensitively in ASCII. Iterates over char boundaries to avoid
+/// false matches inside multi-byte UTF-8 sequences in `haystack` (e.g.
+/// non-ASCII characters in strings or comments). `needle` is assumed
+/// to be ASCII (true for AutoIt identifiers).
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.is_empty() {
+        return Some(0);
+    }
+    let haystack_bytes = haystack.as_bytes();
+    for (i, _) in haystack.char_indices() {
+        let end = i + needle_bytes.len();
+        if end > haystack_bytes.len() {
+            break;
+        }
+        if haystack_bytes[i..end].eq_ignore_ascii_case(needle_bytes) {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// Parse Au3Check output into LSP diagnostics scoped to `target`.
@@ -451,6 +481,26 @@ some other unrelated noise
         // the line). Range spans the full identifier.
         assert_eq!(d.range.start.character, 0);
         assert_eq!(d.range.end.character, 24); // len of "ThisFunctionDoesNotExist"
+    }
+
+    #[test]
+    fn parse_diagnostics_msg_identifier_lookup_is_case_insensitive() {
+        // AutoIt identifiers are case-insensitive; Au3Check normalises to
+        // the builtin's canonical casing in messages (e.g. "FileOpen"
+        // even when the source spells it "fileopen"). The Tier 2 lookup
+        // must match across cases so the squiggle lands on the function
+        // name, not on the closing paren via Tier 3 fallback.
+        let source = "fileopen()\n";
+        let out = format!(
+            "\"{}\"(1,10) : error: FileOpen() [built-in] called with wrong number of args.\n",
+            target().to_string_lossy()
+        );
+        let diags = parse_diagnostics(&out, &target(), source);
+        assert_eq!(diags.len(), 1);
+        let d = &diags[0];
+        // Should span "fileopen" (8 chars), not the trailing ')'.
+        assert_eq!(d.range.start.character, 0);
+        assert_eq!(d.range.end.character, 8);
     }
 
     #[test]
