@@ -19,16 +19,10 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Sprint 1 — tree-sitter parse-tree-per-document infrastructure. Used by
-# document symbols (Day 2), hover (Day 3), and every v0.3+ Option-3 feature
-# (go-to-def, find-refs, completion).
-#
-# Pinned to a specific tree-sitter-autoit commit. The GitHub repo doesn't
-# exist publicly until Phase 8 Bundle 1; until then, local builds need
-# either a temporary flip to `path = "../tree-sitter-autoit"` or a
-# `[patch."https://github.com/sumit-m/tree-sitter-autoit"]` block in a
-# gitignored `.cargo/config.toml`. After Bundle 1 (`tree-sitter-autoit`
-# pushed to GitHub), this resolves naturally.
+# tree-sitter parse-tree-per-document infrastructure. Used by document
+# symbols, hover, and every v0.3+ feature (go-to-def, find-refs,
+# completion). Pinned to a specific tree-sitter-autoit commit for
+# reproducibility; bump the rev when adopting grammar changes.
 tree-sitter = "0.25"
 tree-sitter-autoit = { git = "https://github.com/sumit-m/tree-sitter-autoit", rev = "f421a68daaffaa25d89b34c66d7b97bf49b9d845" }
 

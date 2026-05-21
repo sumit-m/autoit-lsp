@@ -905,6 +905,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-autoit"
 version = "0.1.0"
+source = "git+https://github.com/sumit-m/tree-sitter-autoit?rev=f421a68daaffaa25d89b34c66d7b97bf49b9d845#f421a68daaffaa25d89b34c66d7b97bf49b9d845"
 dependencies = [
  "cc",
  "tree-sitter-language",
