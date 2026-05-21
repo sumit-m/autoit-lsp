@@ -6,7 +6,14 @@ Companion to the [zed-autoit](https://github.com/sumit-m/zed-autoit) Zed editor 
 
 ## Status
 
-**v0.2.1 — edit-time diagnostics with UX polish.** The server wraps AutoIt's official linter, `Au3Check.exe`, and surfaces its output as LSP `textDocument/publishDiagnostics`. Diagnostics refresh on open, on save, and after the user stops typing (configurable debounce, default 400ms; the in-memory buffer is staged to a temp file so Au3Check can lint unsaved edits). v0.2.1 polish: configurable `debounceMs`, instant feedback on the first edit after open/save, multi-character squiggle ranges via token-walk and message-based identifier lookup, content-hash caching skips redundant subprocess spawns. No completion, hover, or go-to-definition yet — those are planned for v0.3+ as the tree-sitter parse tree gets wired in (see the zed-autoit repo's `PLAN.md` Phase 7 v0.3+ roadmap).
+**v0.3.0 — diagnostics + outline + hover.** Layered on top of the v0.2.1 Au3Check diagnostics baseline:
+- An in-memory tree-sitter parse tree per open document (linked from the sibling `tree-sitter-autoit` crate), updated on every edit. Foundation for everything below.
+- `textDocument/documentSymbol` walks the tree to emit a hierarchical outline: functions with parameter children, top-level `Global`/`Const` declarations, `Global Enum` members, `#Region` blocks with their contents nested inside.
+- `textDocument/hover` looks up identifiers under the cursor in a static catalog of ~3,500 documented AutoIt functions (core builtins + UDF library functions) scraped from the official help, and renders a Markdown popup with signature, summary, parameters, return value, and a documentation link.
+
+Au3Check diagnostics from v0.2.1 still work the same way — refresh on open, save, and after the user stops typing (configurable debounce, default 400ms; in-memory buffer is staged to a temp file so Au3Check can lint unsaved edits).
+
+Still planned for v0.4: completion (scope-aware), go-to-definition, find-references, cross-file `#include` resolution. See `zed-autoit/PLAN.md` Phase 7 for the full roadmap.
 
 ## Requirements
 
@@ -53,6 +60,8 @@ Produces `target\release\autoit-lsp.exe`. The Zed extension downloads this binar
 ## Acknowledgments
 
 The Au3Check invocation pattern and stdout parsing regex are adapted from [loganch/AutoIt-VSCode](https://github.com/loganch/AutoIt-VSCode) (MIT, Copyright (c) 2018 Logan Hampton). Their prior art validated that wrapping Au3Check produces useful diagnostics and let us skip a lot of trial-and-error around output format and edge cases.
+
+The built-in function metadata served by hover (and used later for completion) is derived from the official AutoIt v3 documentation at <https://www.autoitscript.com/autoit3/docs/> via the scraper in `scripts/scrape-builtins.ps1` — only structured fields (name, signature, parameters, summary, return value) are extracted, not the full prose. Re-run the scraper after major AutoIt releases to refresh `data/builtins.json`.
 
 ## License
 

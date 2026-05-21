@@ -9,7 +9,11 @@
 //! redundant checks. Speaks LSP over stdio.
 
 mod au3check;
+mod builtins;
+mod hover;
 mod staging;
+mod symbols;
+mod tree;
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -65,7 +69,11 @@ struct Settings {
 }
 
 /// In-memory state for one open document.
-#[derive(Debug, Default)]
+///
+/// `Tree` (from tree-sitter) doesn't impl `Debug`, so we can't derive
+/// `Debug` here — manual impl below shows just the metadata bits, no
+/// tree dump.
+#[derive(Default)]
 struct DocState {
     /// Current buffer text. Updated by `did_change` (FULL sync).
     text: String,
@@ -83,6 +91,25 @@ struct DocState {
     /// Au3Check. If a subsequent check's hash matches, we skip the
     /// subprocess spawn entirely (no-op edit, save-on-idle, etc.).
     last_checked_hash: Option<u64>,
+    /// Sprint 1 — tree-sitter parse tree for this document. Refreshed
+    /// on every `did_open` / `did_change` / `did_save` via a full reparse.
+    /// `None` if no parse has run yet, or (extremely rare) if `parser.parse`
+    /// returned None. Higher-level features (document symbols, hover,
+    /// later go-to-def / find-refs / completion) read this lazily on
+    /// demand — they don't trigger reparses themselves.
+    tree: Option<tree_sitter::Tree>,
+}
+
+impl std::fmt::Debug for DocState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DocState")
+            .field("text_len", &self.text.len())
+            .field("version", &self.version)
+            .field("first_edit_pending", &self.first_edit_pending)
+            .field("last_checked_hash", &self.last_checked_hash)
+            .field("has_tree", &self.tree.is_some())
+            .finish()
+    }
 }
 
 /// All Backend state lives behind an `Arc` so we can hand cheap clones
@@ -338,6 +365,14 @@ impl LanguageServer for Backend {
                         ..Default::default()
                     },
                 )),
+                // Sprint 1 Day 2 — Zed's outline panel queries documentSymbol.
+                // We respond with a hierarchical (nested) list rather than the
+                // legacy flat SymbolInformation form.
+                document_symbol_provider: Some(OneOf::Left(true)),
+                // Sprint 1 Day 3 — hover surfaces docs for built-in + UDF
+                // library functions sourced from autoitscript.com via the
+                // scrape-builtins.ps1 script.
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
         })
@@ -367,6 +402,10 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
+        // Parse before taking the docs write lock so we don't hold it
+        // across the (cheap, microsecond-scale) parse. Keeps the lock
+        // window minimal for any concurrent read.
+        let tree = tree::parse(&text);
         {
             let mut docs = self.inner.docs.write().await;
             docs.insert(
@@ -376,6 +415,7 @@ impl LanguageServer for Backend {
                     version: 0,
                     first_edit_pending: true,
                     last_checked_hash: None,
+                    tree,
                 },
             );
         }
@@ -398,6 +438,10 @@ impl LanguageServer for Backend {
             return;
         };
 
+        // Parse before taking the docs write lock (parse on its own
+        // copy of the text doesn't need the lock).
+        let new_tree = tree::parse(&new_text);
+
         // A3 — capture the first-edit flag and clear it in one
         // critical section, so we know whether to skip the debounce
         // for this notification.
@@ -406,6 +450,7 @@ impl LanguageServer for Backend {
             let state = docs.entry(uri.clone()).or_default();
             state.text = new_text;
             state.version = state.version.wrapping_add(1);
+            state.tree = new_tree;
             let skip = state.first_edit_pending;
             state.first_edit_pending = false;
             (state.text.clone(), state.version, skip)
@@ -455,6 +500,45 @@ impl LanguageServer for Backend {
         if let Some(text) = text {
             self.check_and_publish(uri, text).await;
         }
+    }
+
+    /// Sprint 1 Day 2 — outline-panel response. Looks up the cached parse
+    /// tree for the document (populated by did_open/did_change), walks it
+    /// to produce a hierarchical DocumentSymbol list, and returns. If we
+    /// haven't seen the document yet (race with did_open?) we return an
+    /// empty list rather than erroring — the client retries shortly.
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        let docs = self.inner.docs.read().await;
+        let Some(state) = docs.get(&uri) else {
+            tracing::debug!(uri = %uri, "documentSymbol on unknown doc — returning empty");
+            return Ok(Some(DocumentSymbolResponse::Nested(vec![])));
+        };
+        let Some(tree) = state.tree.as_ref() else {
+            return Ok(Some(DocumentSymbolResponse::Nested(vec![])));
+        };
+        let syms = symbols::document_symbols(tree, &state.text);
+        tracing::debug!(uri = %uri, count = syms.len(), "documentSymbol responding");
+        Ok(Some(DocumentSymbolResponse::Nested(syms)))
+    }
+
+    /// Sprint 1 Day 3 — hover for built-in / UDF library functions. Uses
+    /// the cached parse tree to find the identifier under the cursor, then
+    /// looks it up in the static `builtins` catalog.
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let docs = self.inner.docs.read().await;
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        let Some(tree) = state.tree.as_ref() else {
+            return Ok(None);
+        };
+        Ok(hover::hover_for(tree, &state.text, position))
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
