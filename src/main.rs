@@ -10,8 +10,10 @@
 
 mod au3check;
 mod builtins;
+mod complete;
 mod hover;
 mod index;
+mod macros;
 mod staging;
 mod symbols;
 mod tree;
@@ -26,7 +28,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::sync::RwLock as AsyncRwLock;
 use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::*;
+use tower_lsp::lsp_types::{
+    CompletionOptions, CompletionParams, CompletionResponse, *,
+};
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use au3check::Au3CheckConfig;
@@ -325,6 +329,56 @@ impl Backend {
     }
 }
 
+/// Extract the partial token that the user is currently typing, ending at
+/// `position`. Walks backwards from the cursor column collecting characters
+/// that are valid in an AutoIt identifier or sigil:
+///   - `$` prefix for variables
+///   - `@` prefix for macros
+///   - Letters, digits, underscore for function/identifier names
+///
+/// Returns an empty string when the cursor is between tokens (whitespace,
+/// operator, punctuation).
+fn partial_token_at(source: &str, position: tower_lsp::lsp_types::Position) -> String {
+    let line_idx = position.line as usize;
+    let col_utf16 = position.character as usize;
+
+    // Find the line as a &str.
+    let line = source.split('\n').nth(line_idx).unwrap_or("");
+
+    // Convert UTF-16 column to a byte offset within the line.
+    let mut byte_col = 0usize;
+    let mut utf16_count = 0usize;
+    for ch in line.chars() {
+        if utf16_count >= col_utf16 {
+            break;
+        }
+        utf16_count += ch.len_utf16();
+        byte_col += ch.len_utf8();
+    }
+
+    // Walk back from byte_col collecting identifier characters.
+    let before = &line[..byte_col];
+    let token: String = before
+        .chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$' || *c == '@')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+
+    // Only keep the token if it starts with a recognised sigil or letter.
+    // This prevents returning a bare `_` or digit sequence as a prefix.
+    if token.starts_with('$')
+        || token.starts_with('@')
+        || token.starts_with(|c: char| c.is_alphabetic() || c == '_')
+    {
+        token
+    } else {
+        String::new()
+    }
+}
+
 /// DefaultHasher of the buffer text. We don't need cryptographic
 /// strength — only "did this exact text get linted already." Collisions
 /// (~1 in 2^64) would skip a lint where they shouldn't, which is
@@ -383,6 +437,14 @@ impl LanguageServer for Backend {
                 // by the per-document FileIndex built in index.rs.
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                // Sprint 3 — completion. Trigger characters `$` and `@`
+                // fire the popup immediately when those sigils are typed;
+                // regular alpha input triggers via Zed's word-completion path.
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec!["$".into(), "@".into()]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         })
@@ -656,6 +718,54 @@ impl LanguageServer for Backend {
             }
 
             Some(locations)
+        })();
+
+        Ok(result)
+    }
+
+    /// Sprint 3 — completion. Determines context from the partial token at
+    /// the cursor:
+    ///   `$…`  → scope-filtered variables, constants, parameters.
+    ///   `@…`  → AutoIt built-in macros.
+    ///   letter → user-defined functions + 3,542 AutoIt built-in functions.
+    ///
+    /// Returns an empty list when the cursor is inside a string or comment —
+    /// detected by checking the tree-sitter node kind at the cursor position.
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        let docs = self.inner.docs.read().await;
+        let result = (|| -> Option<CompletionResponse> {
+            let state = docs.get(&uri)?;
+            let tree = state.tree.as_ref()?;
+            let file_index = state.index.as_ref()?;
+
+            // Determine the partial token at the cursor. We walk back from
+            // the cursor column to find the start of the current word.
+            let prefix = partial_token_at(&state.text, position);
+
+            // Check if the cursor is inside a string or comment via the
+            // parse tree — suppress completions in those contexts.
+            let in_noise = tree::node_at_position(tree, &state.text, position)
+                .map(|n| matches!(n.kind(), "string" | "line_comment" | "block_comment"))
+                .unwrap_or(false);
+
+            // Determine cursor scope for variable filtering.
+            let cursor_scope = tree::node_at_position(tree, &state.text, position)
+                .and_then(|n| index::cursor_scope(n, &state.text));
+
+            let items = complete::completions_at(
+                &prefix,
+                file_index,
+                cursor_scope.as_deref(),
+                in_noise,
+            );
+
+            Some(CompletionResponse::Array(items))
         })();
 
         Ok(result)

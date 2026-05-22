@@ -132,6 +132,12 @@ pub fn lookup(name: &str) -> Option<&'static FunctionDoc> {
     catalog().functions.get(&name.to_lowercase())
 }
 
+/// Iterate over every entry in the catalog. Used by Sprint 3 completion to
+/// offer all built-in functions as candidates (prefix-filtered by the caller).
+pub fn all_entries() -> impl Iterator<Item = &'static FunctionDoc> {
+    catalog().functions.values()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
