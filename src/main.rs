@@ -576,6 +576,48 @@ impl LanguageServer for Backend {
     }
 }
 
+/// Write the path of `autoit-run.exe` to the Windows registry so that
+/// Zed's `tasks.json` can discover it without requiring the user to add
+/// anything to their PATH.
+///
+/// Looks for `autoit-run.exe` next to this executable (i.e. in the Zed
+/// extension cache directory after the zip is extracted). If found, writes
+/// its absolute path to `HKCU\SOFTWARE\zed-autoit\RunnerPath`.
+///
+/// Best-effort — all errors are silently ignored. If registration fails
+/// (no `autoit-run.exe` sibling, permissions issue, non-UTF8 path), the
+/// `tasks.json` PATH lookup still works for users who have `autoit-run`
+/// on their PATH.
+#[cfg(windows)]
+fn register_autoit_run() {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let runner = match std::env::current_exe() {
+        Ok(exe) => match exe.parent() {
+            Some(dir) => dir.join("autoit-run.exe"),
+            None => return,
+        },
+        Err(_) => return,
+    };
+
+    if !runner.is_file() {
+        return;
+    }
+
+    let runner_str = match runner.to_str() {
+        Some(s) => s.to_owned(),
+        None => return,
+    };
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok((key, _)) = hkcu.create_subkey(r"SOFTWARE\zed-autoit") {
+        if key.set_value("RunnerPath", &runner_str).is_ok() {
+            tracing::info!(path = %runner.display(), "registered autoit-run.exe in HKCU");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // LSP servers speak JSON-RPC on stdout. Logging must go to stderr so
@@ -587,6 +629,12 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Register autoit-run.exe in HKCU so tasks.json can discover it even
+    // when it isn't on the user's PATH. No-op on non-Windows and silently
+    // ignored on any failure (missing sibling binary, permission error, etc.).
+    #[cfg(windows)]
+    register_autoit_run();
 
     let au3check = au3check::discover_au3check();
 

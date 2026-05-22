@@ -1,6 +1,6 @@
 [package]
 name = "autoit-lsp"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Language Server for AutoIt v3 — Au3Check diagnostics wrapper"
 license = "MIT"
@@ -8,6 +8,19 @@ repository = "https://github.com/sumit-m/autoit-lsp"
 readme = "README.md"
 keywords = ["lsp", "autoit", "language-server"]
 categories = ["development-tools"]
+
+[[bin]]
+name = "autoit-lsp"
+path = "src/main.rs"
+
+# Thin launcher that streams AutoIt3.exe stdout to Zed's terminal.
+# AutoIt3.exe is a GUI-subsystem executable: ConsoleWrite() only writes
+# to stdout when given a real pipe handle — not a console handle. This
+# console-subsystem wrapper spawns AutoIt3.exe with Stdio::piped() and
+# re-prints each line as it arrives, enabling live ConsoleWrite() output.
+[[bin]]
+name = "autoit-run"
+path = "src/bin/run.rs"
 
 [dependencies]
 tower-lsp = "0.20"

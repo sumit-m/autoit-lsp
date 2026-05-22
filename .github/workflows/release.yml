@@ -67,6 +67,7 @@ jobs:
           $stage = "autoit-lsp-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" $stage/
+          Copy-Item "target/${{ matrix.target }}/release/autoit-run.exe" $stage/
           Copy-Item LICENSE $stage/
           Copy-Item README.md $stage/
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
