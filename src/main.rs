@@ -11,6 +11,7 @@
 mod au3check;
 mod builtins;
 mod hover;
+mod index;
 mod staging;
 mod symbols;
 mod tree;
@@ -98,6 +99,10 @@ struct DocState {
     /// later go-to-def / find-refs / completion) read this lazily on
     /// demand — they don't trigger reparses themselves.
     tree: Option<tree_sitter::Tree>,
+    /// Sprint 2 — per-document symbol index. Rebuilt alongside the parse
+    /// tree on every `did_open` / `did_change`. Feeds go-to-definition
+    /// and find-references. `None` only when `tree` is also None.
+    index: Option<index::FileIndex>,
 }
 
 impl std::fmt::Debug for DocState {
@@ -108,6 +113,7 @@ impl std::fmt::Debug for DocState {
             .field("first_edit_pending", &self.first_edit_pending)
             .field("last_checked_hash", &self.last_checked_hash)
             .field("has_tree", &self.tree.is_some())
+            .field("has_index", &self.index.is_some())
             .finish()
     }
 }
@@ -373,6 +379,10 @@ impl LanguageServer for Backend {
                 // library functions sourced from autoitscript.com via the
                 // scrape-builtins.ps1 script.
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                // Sprint 2 — go-to-definition and find-references backed
+                // by the per-document FileIndex built in index.rs.
+                definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -402,10 +412,10 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
-        // Parse before taking the docs write lock so we don't hold it
-        // across the (cheap, microsecond-scale) parse. Keeps the lock
-        // window minimal for any concurrent read.
+        // Parse and index before taking the docs write lock so we don't
+        // hold it across the (cheap, microsecond-scale) work.
         let tree = tree::parse(&text);
+        let file_index = tree.as_ref().map(|t| index::build_index(t, &text));
         {
             let mut docs = self.inner.docs.write().await;
             docs.insert(
@@ -416,6 +426,7 @@ impl LanguageServer for Backend {
                     first_edit_pending: true,
                     last_checked_hash: None,
                     tree,
+                    index: file_index,
                 },
             );
         }
@@ -438,9 +449,10 @@ impl LanguageServer for Backend {
             return;
         };
 
-        // Parse before taking the docs write lock (parse on its own
-        // copy of the text doesn't need the lock).
+        // Parse and index before taking the docs write lock (both operate
+        // on their own copy of the text, no lock needed).
         let new_tree = tree::parse(&new_text);
+        let new_index = new_tree.as_ref().map(|t| index::build_index(t, &new_text));
 
         // A3 — capture the first-edit flag and clear it in one
         // critical section, so we know whether to skip the debounce
@@ -451,6 +463,7 @@ impl LanguageServer for Backend {
             state.text = new_text;
             state.version = state.version.wrapping_add(1);
             state.tree = new_tree;
+            state.index = new_index;
             let skip = state.first_edit_pending;
             state.first_edit_pending = false;
             (state.text.clone(), state.version, skip)
@@ -539,6 +552,113 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         Ok(hover::hover_for(tree, &state.text, position))
+    }
+
+    /// Sprint 2 — go-to-definition. Resolves the symbol under the cursor
+    /// using the per-document FileIndex with scope-aware lookup:
+    /// parameters and local variables shadow global declarations of the
+    /// same name when the cursor is inside their function.
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let docs = self.inner.docs.read().await;
+        let result = (|| -> Option<GotoDefinitionResponse> {
+            let state = docs.get(&uri)?;
+            let tree = state.tree.as_ref()?;
+            let file_index = state.index.as_ref()?;
+
+            let node = tree::node_at_position(tree, &state.text, position)?;
+
+            // Walk up from the deepest leaf to find a variable or identifier.
+            let sym_node = if matches!(node.kind(), "variable" | "identifier") {
+                node
+            } else {
+                let parent = node.parent()?;
+                if matches!(parent.kind(), "variable" | "identifier") {
+                    parent
+                } else {
+                    return None;
+                }
+            };
+
+            let name = sym_node.utf8_text(state.text.as_bytes()).ok()?;
+            let scope = index::cursor_scope(sym_node, &state.text);
+
+            let def = file_index.resolve_def(name, scope.as_deref())?;
+
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: def.name_range,
+            }))
+        })();
+
+        Ok(result)
+    }
+
+    /// Sprint 2 — find-references. Returns all usage sites of the symbol
+    /// under the cursor, scope-filtered to match the definition's visibility:
+    /// globals/functions return file-wide refs; locals/params return only
+    /// refs inside their declaring function.
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let include_decl = params.context.include_declaration;
+
+        let docs = self.inner.docs.read().await;
+        let result = (|| -> Option<Vec<Location>> {
+            let state = docs.get(&uri)?;
+            let tree = state.tree.as_ref()?;
+            let file_index = state.index.as_ref()?;
+
+            let node = tree::node_at_position(tree, &state.text, position)?;
+
+            let sym_node = if matches!(node.kind(), "variable" | "identifier") {
+                node
+            } else {
+                let parent = node.parent()?;
+                if matches!(parent.kind(), "variable" | "identifier") {
+                    parent
+                } else {
+                    return None;
+                }
+            };
+
+            let name = sym_node.utf8_text(state.text.as_bytes()).ok()?;
+            let cursor_scope = index::cursor_scope(sym_node, &state.text);
+
+            // Resolve the definition first so we know its scope, which
+            // determines the ref-filtering strategy.
+            let def = file_index.resolve_def(name, cursor_scope.as_deref())?;
+            let def_scope = def.scope_func.as_deref();
+
+            let refs = file_index.find_refs(name, def_scope);
+
+            let mut locations: Vec<Location> = refs
+                .iter()
+                .map(|r| Location {
+                    uri: uri.clone(),
+                    range: r.usage_range,
+                })
+                .collect();
+
+            if include_decl {
+                locations.insert(
+                    0,
+                    Location {
+                        uri: uri.clone(),
+                        range: def.name_range,
+                    },
+                );
+            }
+
+            Some(locations)
+        })();
+
+        Ok(result)
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
