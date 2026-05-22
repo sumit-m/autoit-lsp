@@ -755,8 +755,15 @@ impl LanguageServer for Backend {
                 .unwrap_or(false);
 
             // Determine cursor scope for variable filtering.
-            let cursor_scope = tree::node_at_position(tree, &state.text, position)
-                .and_then(|n| index::cursor_scope(n, &state.text));
+            // Use scope_at_line (line-range based, immune to tree-sitter
+            // error-recovery hoisting) rather than cursor_scope (tree-walk).
+            // During mid-edit states a bare `$` is invalid syntax, so
+            // tree-sitter may place the error node outside the enclosing
+            // function_declaration — cursor_scope would then return None and
+            // only globals would appear.  scope_at_line checks whether the
+            // cursor line falls within a function's stored full_range, which
+            // survives any parse-error recovery intact.
+            let cursor_scope = index::scope_at_line(file_index, position.line);
 
             let items = complete::completions_at(
                 &prefix,

@@ -123,6 +123,11 @@ pub fn build_index(tree: &Tree, source: &str) -> FileIndex {
 /// Find the lowercase name of the function that encloses `node`, or `None`
 /// if the node is at file scope. Used by the definition/references handlers
 /// to determine the caller's scope before looking up the index.
+///
+/// **Limitation:** if tree-sitter's error recovery hoists the node out of
+/// its containing `function_declaration` (common when the buffer has a
+/// mid-edit parse error, e.g. a bare `$`), this returns `None`. For
+/// completion use [`scope_at_line`] which is immune to that.
 pub fn cursor_scope(mut node: Node, source: &str) -> Option<String> {
     while let Some(parent) = node.parent() {
         node = parent;
@@ -134,6 +139,27 @@ pub fn cursor_scope(mut node: Node, source: &str) -> Option<String> {
                     .ok()?
                     .to_lowercase(),
             );
+        }
+    }
+    None
+}
+
+/// Determine the containing function scope for a given line number by
+/// comparing against the stored function declaration ranges in `index`.
+///
+/// Unlike [`cursor_scope`] this does **not** touch the live parse tree, so
+/// it is unaffected by tree-sitter error recovery during mid-edit states
+/// (e.g. a bare `$` or `@` that hasn't been completed yet). Used as the
+/// primary scope source for completion.
+pub fn scope_at_line(index: &FileIndex, line: u32) -> Option<String> {
+    for defs in index.defs.values() {
+        for def in defs {
+            if def.kind == DefKind::Function
+                && line >= def.full_range.start.line
+                && line <= def.full_range.end.line
+            {
+                return Some(def.display_name.to_lowercase());
+            }
         }
     }
     None
@@ -583,5 +609,49 @@ mod tests {
         let tree = parse(source).expect("parse");
         let node = node_at_position(&tree, source, Position::new(1, 4)).expect("node");
         assert_eq!(cursor_scope(node, source).as_deref(), Some("myfunc"));
+    }
+
+    // ── scope_at_line ────────────────────────────────────────────────────────
+
+    #[test]
+    fn scope_at_line_inside_clean_function() {
+        let source = "Func MyHelper()\n    Local $x = 1\n    Return $x\nEndFunc\n";
+        let index = index_for(source);
+        // Line 1 is "    Local $x = 1" — inside MyHelper (lines 0–3).
+        assert_eq!(scope_at_line(&index, 1).as_deref(), Some("myhelper"));
+    }
+
+    #[test]
+    fn scope_at_line_at_file_scope_returns_none() {
+        let source = "Global $g = 1\nFunc F()\nEndFunc\n";
+        let index = index_for(source);
+        // Line 0 is "Global $g = 1" — file scope.
+        assert!(scope_at_line(&index, 0).is_none());
+    }
+
+    #[test]
+    fn scope_at_line_with_bare_dollar_inside_function() {
+        // Source that simulates the user typing `$` mid-edit inside a function.
+        // A bare `$` is invalid AutoIt syntax; tree-sitter must use error recovery.
+        // scope_at_line must still return the enclosing function.
+        let source = "Func MyHelper()\n    Local $x = 1\n    $\n    Return $x\nEndFunc\n";
+        let index = index_for(source);
+        // Line 2 is "    $" — should still be inside MyHelper (lines 0–4).
+        let scope = scope_at_line(&index, 2);
+        assert_eq!(
+            scope.as_deref(),
+            Some("myhelper"),
+            "scope_at_line must detect the enclosing function even with a parse error on that line. \
+             If this fails, tree-sitter error-recovery is truncating the function_declaration range."
+        );
+    }
+
+    #[test]
+    fn scope_at_line_with_bare_at_inside_function() {
+        // Same as above but for `@` (macro trigger character).
+        let source = "Func MyHelper()\n    Local $x = 1\n    @\n    Return $x\nEndFunc\n";
+        let index = index_for(source);
+        let scope = scope_at_line(&index, 2);
+        assert_eq!(scope.as_deref(), Some("myhelper"));
     }
 }
