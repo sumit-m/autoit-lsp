@@ -99,6 +99,16 @@ fn install_dir_from_registry() -> Option<PathBuf> {
     None
 }
 
+/// Discover AutoIt's standard `Include\` directory (the search path for
+/// `#include <File.au3>` directives). Returns `None` on non-Windows or
+/// when AutoIt isn't installed.
+pub fn discover_autoit_include_dir() -> Option<PathBuf> {
+    let dir = install_dir_from_registry()
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)\AutoIt3"));
+    let candidate = dir.join("Include");
+    candidate.is_dir().then_some(candidate)
+}
+
 /// Build the Au3Check argument list from a config. Extracted so unit
 /// tests can verify flag generation without spawning the actual
 /// process.

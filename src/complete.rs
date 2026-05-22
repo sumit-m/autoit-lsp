@@ -33,6 +33,7 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::builtins;
+use crate::includes::WorkspaceIndex;
 use crate::index::{DefKind, FileIndex};
 use crate::macros;
 
@@ -48,11 +49,13 @@ const MAX_ITEMS: usize = 200;
 /// - `cursor_scope` — lowercase name of the containing function, or `None`
 ///   for file-level code. Determines variable scope.
 /// - `in_string_or_comment` — if true, return an empty list immediately.
+/// - `workspace` — optional workspace index from Sprint 4 cross-file resolution.
 pub fn completions_at(
     prefix: &str,
     file_index: &FileIndex,
     cursor_scope: Option<&str>,
     in_string_or_comment: bool,
+    workspace: Option<&WorkspaceIndex>,
 ) -> Vec<CompletionItem> {
     if in_string_or_comment {
         return vec![];
@@ -61,11 +64,11 @@ pub fn completions_at(
     let lower = prefix.to_lowercase();
 
     if lower.starts_with('$') {
-        variable_completions(&lower, file_index, cursor_scope)
+        variable_completions(&lower, file_index, cursor_scope, workspace)
     } else if lower.starts_with('@') {
         macro_completions(&lower)
     } else {
-        function_completions(&lower, file_index)
+        function_completions(&lower, file_index, workspace)
     }
 }
 
@@ -75,6 +78,7 @@ fn variable_completions(
     prefix: &str,
     file_index: &FileIndex,
     cursor_scope: Option<&str>,
+    workspace: Option<&WorkspaceIndex>,
 ) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = file_index
         .defs
@@ -114,6 +118,26 @@ fn variable_completions(
         })
         .collect();
 
+    // Workspace globals from included files — always visible, prefix-filtered.
+    if let Some(ws) = workspace {
+        for entry in ws.all_variables() {
+            let def = &entry.1;
+            let key = def.display_name.to_lowercase();
+            if key.starts_with(prefix) {
+                let kind = match def.kind {
+                    DefKind::Constant | DefKind::EnumMember => CompletionItemKind::CONSTANT,
+                    _ => CompletionItemKind::VARIABLE,
+                };
+                items.push(CompletionItem {
+                    label: def.display_name.clone(),
+                    kind: Some(kind),
+                    detail: Some("(included)".into()),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
     items.sort_by(|a, b| a.label.cmp(&b.label));
     items.truncate(MAX_ITEMS);
     items
@@ -143,7 +167,11 @@ fn macro_completions(prefix: &str) -> Vec<CompletionItem> {
 
 // ─── Function completions (letter…) ──────────────────────────────────────────
 
-fn function_completions(prefix: &str, file_index: &FileIndex) -> Vec<CompletionItem> {
+fn function_completions(
+    prefix: &str,
+    file_index: &FileIndex,
+    workspace: Option<&WorkspaceIndex>,
+) -> Vec<CompletionItem> {
     // User-defined functions are always included — there are never thousands
     // of them and they're the most contextually relevant results.
     let mut user_items: Vec<CompletionItem> = file_index
@@ -166,6 +194,23 @@ fn function_completions(prefix: &str, file_index: &FileIndex) -> Vec<CompletionI
         })
         .collect();
     user_items.sort_by(|a, b| a.label.cmp(&b.label));
+
+    // Workspace functions from included files — middle tier between user funcs and builtins.
+    if let Some(ws) = workspace {
+        let ws_items: Vec<CompletionItem> = ws
+            .all_functions()
+            .filter(|entry| entry.1.display_name.to_lowercase().starts_with(prefix))
+            .map(|entry| CompletionItem {
+                label: entry.1.display_name.clone(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some("(included)".into()),
+                ..Default::default()
+            })
+            .collect();
+        user_items.extend(ws_items);
+        user_items.sort_by(|a, b| a.label.cmp(&b.label));
+        user_items.dedup_by(|a, b| a.label.eq_ignore_ascii_case(&b.label));
+    }
 
     // Built-ins fill the remaining capacity after user functions are reserved.
     let builtin_cap = MAX_ITEMS.saturating_sub(user_items.len());
@@ -191,7 +236,7 @@ fn function_completions(prefix: &str, file_index: &FileIndex) -> Vec<CompletionI
     builtin_items.sort_by(|a, b| a.label.cmp(&b.label));
     builtin_items.truncate(builtin_cap);
 
-    // Return user functions first, then builtins.
+    // Return user functions (+ workspace) first, then builtins.
     user_items.extend(builtin_items);
     user_items
 }
@@ -214,7 +259,7 @@ mod tests {
     #[test]
     fn dollar_prefix_returns_variables_not_functions() {
         let index = idx("Global $foo = 1\nFunc Bar()\nEndFunc\n");
-        let items = completions_at("$", &index, None, false);
+        let items = completions_at("$", &index, None, false, None);
         assert!(items.iter().any(|i| i.label == "$foo"), "should include $foo");
         assert!(
             items.iter().all(|i| i.label != "Bar"),
@@ -225,7 +270,7 @@ mod tests {
     #[test]
     fn dollar_prefix_filters_by_partial_name() {
         let index = idx("Global $fooA = 1\nGlobal $fooB = 2\nGlobal $other = 3\n");
-        let items = completions_at("$foo", &index, None, false);
+        let items = completions_at("$foo", &index, None, false, None);
         assert!(items.iter().any(|i| i.label == "$fooA"));
         assert!(items.iter().any(|i| i.label == "$fooB"));
         assert!(items.iter().all(|i| i.label != "$other"));
@@ -236,11 +281,11 @@ mod tests {
         let source = "Func F()\n    Local $local = 1\nEndFunc\nGlobal $global = 2\n";
         let index = idx(source);
         // At file scope: only global visible.
-        let file_items = completions_at("$", &index, None, false);
+        let file_items = completions_at("$", &index, None, false, None);
         assert!(file_items.iter().any(|i| i.label == "$global"));
         assert!(file_items.iter().all(|i| i.label != "$local"));
         // Inside F: both visible.
-        let func_items = completions_at("$", &index, Some("f"), false);
+        let func_items = completions_at("$", &index, Some("f"), false, None);
         assert!(func_items.iter().any(|i| i.label == "$global"));
         assert!(func_items.iter().any(|i| i.label == "$local"));
     }
@@ -249,16 +294,16 @@ mod tests {
     fn parameter_visible_inside_function_only() {
         let source = "Func Add($a, $b)\nReturn $a\nEndFunc\n";
         let index = idx(source);
-        let in_func = completions_at("$", &index, Some("add"), false);
+        let in_func = completions_at("$", &index, Some("add"), false, None);
         assert!(in_func.iter().any(|i| i.label == "$a"));
-        let at_file = completions_at("$", &index, None, false);
+        let at_file = completions_at("$", &index, None, false, None);
         assert!(at_file.iter().all(|i| i.label != "$a"));
     }
 
     #[test]
     fn const_has_constant_completion_kind() {
         let index = idx("Global Const $MAX = 100\n");
-        let items = completions_at("$", &index, None, false);
+        let items = completions_at("$", &index, None, false, None);
         let item = items.iter().find(|i| i.label == "$MAX").expect("$MAX");
         assert_eq!(item.kind, Some(CompletionItemKind::CONSTANT));
     }
@@ -268,7 +313,7 @@ mod tests {
     #[test]
     fn at_prefix_returns_macros_not_variables() {
         let index = idx("Global $x = 1\n");
-        let items = completions_at("@", &index, None, false);
+        let items = completions_at("@", &index, None, false, None);
         assert!(items.iter().any(|i| i.label == "@CRLF"));
         assert!(items.iter().all(|i| i.label != "$x"));
     }
@@ -276,7 +321,7 @@ mod tests {
     #[test]
     fn at_prefix_filters_by_partial_name() {
         let index = idx("");
-        let items = completions_at("@sc", &index, None, false);
+        let items = completions_at("@sc", &index, None, false, None);
         assert!(items.iter().any(|i| i.label.to_lowercase().starts_with("@sc")));
         assert!(items.iter().all(|i| i.label.to_lowercase().starts_with("@sc")));
     }
@@ -284,7 +329,7 @@ mod tests {
     #[test]
     fn at_items_have_constant_kind() {
         let index = idx("");
-        let items = completions_at("@CR", &index, None, false);
+        let items = completions_at("@CR", &index, None, false, None);
         assert!(items.iter().all(|i| i.kind == Some(CompletionItemKind::CONSTANT)));
     }
 
@@ -293,28 +338,28 @@ mod tests {
     #[test]
     fn letter_prefix_returns_builtins() {
         let index = idx("");
-        let items = completions_at("msg", &index, None, false);
+        let items = completions_at("msg", &index, None, false, None);
         assert!(items.iter().any(|i| i.label.to_lowercase().starts_with("msg")));
     }
 
     #[test]
     fn letter_prefix_returns_user_functions() {
         let index = idx("Func MyHelper()\nEndFunc\n");
-        let items = completions_at("my", &index, None, false);
+        let items = completions_at("my", &index, None, false, None);
         assert!(items.iter().any(|i| i.label == "MyHelper"));
     }
 
     #[test]
     fn user_function_does_not_appear_on_dollar_prefix() {
         let index = idx("Func Foo()\nEndFunc\n");
-        let items = completions_at("$", &index, None, false);
+        let items = completions_at("$", &index, None, false, None);
         assert!(items.iter().all(|i| i.label != "Foo"));
     }
 
     #[test]
     fn empty_letter_prefix_includes_builtins_and_user_functions() {
         let index = idx("Func Zzzz()\nEndFunc\n");
-        let items = completions_at("", &index, None, false);
+        let items = completions_at("", &index, None, false, None);
         assert!(items.iter().any(|i| i.label == "Zzzz"));
         assert!(items.len() > 100, "should include many builtins");
     }
@@ -324,13 +369,13 @@ mod tests {
     #[test]
     fn in_string_returns_empty() {
         let index = idx("Global $x = 1\n");
-        assert!(completions_at("$", &index, None, true).is_empty());
+        assert!(completions_at("$", &index, None, true, None).is_empty());
     }
 
     #[test]
     fn in_comment_returns_empty() {
         let index = idx("Global $x = 1\n");
-        assert!(completions_at("msg", &index, None, true).is_empty());
+        assert!(completions_at("msg", &index, None, true, None).is_empty());
     }
 
     // ── Item cap ──────────────────────────────────────────────────────────────
@@ -338,7 +383,7 @@ mod tests {
     #[test]
     fn result_never_exceeds_max_items() {
         let index = idx("");
-        let items = completions_at("", &index, None, false);
+        let items = completions_at("", &index, None, false, None);
         assert!(items.len() <= MAX_ITEMS);
     }
 }

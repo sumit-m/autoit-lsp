@@ -12,6 +12,7 @@ mod au3check;
 mod builtins;
 mod complete;
 mod hover;
+mod includes;
 mod index;
 mod macros;
 mod staging;
@@ -107,6 +108,11 @@ struct DocState {
     /// tree on every `did_open` / `did_change`. Feeds go-to-definition
     /// and find-references. `None` only when `tree` is also None.
     index: Option<index::FileIndex>,
+    /// Sprint 4 — cross-file workspace index built by resolving the full
+    /// `#include` tree on `did_open` and `did_save`. Feeds cross-file
+    /// go-to-definition, find-references, and completion from included files.
+    /// `None` until the first open/save completes.
+    workspace_index: Option<includes::WorkspaceIndex>,
 }
 
 impl std::fmt::Debug for DocState {
@@ -118,6 +124,7 @@ impl std::fmt::Debug for DocState {
             .field("last_checked_hash", &self.last_checked_hash)
             .field("has_tree", &self.tree.is_some())
             .field("has_index", &self.index.is_some())
+            .field("has_workspace_index", &self.workspace_index.is_some())
             .finish()
     }
 }
@@ -133,6 +140,10 @@ struct Inner {
     /// default chain. `None` means none of those probes hit a real
     /// file.
     au3check: Option<PathBuf>,
+    /// Path to AutoIt's standard `Include\` directory for
+    /// `#include <Library.au3>` resolution. `None` on non-Windows or
+    /// when AutoIt isn't installed.
+    autoit_include_dir: Option<PathBuf>,
     /// All server-wide settings. `std::sync::RwLock` is fine because
     /// we never hold the lock across an await.
     settings: RwLock<Settings>,
@@ -148,11 +159,16 @@ struct Backend {
 }
 
 impl Backend {
-    fn new(client: Client, au3check: Option<PathBuf>) -> Self {
+    fn new(
+        client: Client,
+        au3check: Option<PathBuf>,
+        autoit_include_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 client,
                 au3check,
+                autoit_include_dir,
                 settings: RwLock::new(Settings::default()),
                 docs: AsyncRwLock::new(HashMap::new()),
             }),
@@ -440,8 +456,10 @@ impl LanguageServer for Backend {
                 // Sprint 3 — completion. Trigger characters `$` and `@`
                 // fire the popup immediately when those sigils are typed;
                 // regular alpha input triggers via Zed's word-completion path.
+                // Sprint 4 — `<` added for include-path completion in
+                // `#include <Library.au3>` directives.
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec!["$".into(), "@".into()]),
+                    trigger_characters: Some(vec!["$".into(), "@".into(), "<".into()]),
                     resolve_provider: Some(false),
                     ..Default::default()
                 }),
@@ -478,6 +496,16 @@ impl LanguageServer for Backend {
         // hold it across the (cheap, microsecond-scale) work.
         let tree = tree::parse(&text);
         let file_index = tree.as_ref().map(|t| index::build_index(t, &text));
+
+        // Sprint 4 — build the workspace index by resolving the #include tree.
+        // Done outside the docs lock because it involves async disk reads.
+        let workspace_index = if let (Some(t), Ok(path)) = (tree.as_ref(), uri.to_file_path()) {
+            let include_dir = self.inner.autoit_include_dir.as_deref();
+            Some(includes::build_workspace_index(&path, t, &text, include_dir).await)
+        } else {
+            None
+        };
+
         {
             let mut docs = self.inner.docs.write().await;
             docs.insert(
@@ -489,6 +517,7 @@ impl LanguageServer for Backend {
                     last_checked_hash: None,
                     tree,
                     index: file_index,
+                    workspace_index,
                 },
             );
         }
@@ -526,6 +555,8 @@ impl LanguageServer for Backend {
             state.version = state.version.wrapping_add(1);
             state.tree = new_tree;
             state.index = new_index;
+            // workspace_index is NOT rebuilt on every keystroke — only on
+            // did_open and did_save (eager resolution strategy).
             let skip = state.first_edit_pending;
             state.first_edit_pending = false;
             (state.text.clone(), state.version, skip)
@@ -572,9 +603,31 @@ impl LanguageServer for Backend {
                 None
             }
         };
-        if let Some(text) = text {
-            self.check_and_publish(uri, text).await;
+        let Some(text) = text else { return; };
+
+        // Sprint 4 — rebuild workspace index on save (outside the lock because
+        // it does async disk reads). Re-parse the text cheaply (microseconds)
+        // to avoid holding the docs lock across the await.
+        let workspace_index = if let Ok(path) = uri.to_file_path() {
+            if let Some(tree) = tree::parse(&text) {
+                let include_dir = self.inner.autoit_include_dir.as_deref();
+                Some(includes::build_workspace_index(&path, &tree, &text, include_dir).await)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Store the new workspace index.
+        {
+            let mut docs = self.inner.docs.write().await;
+            if let Some(state) = docs.get_mut(&uri) {
+                state.workspace_index = workspace_index;
+            }
         }
+
+        self.check_and_publish(uri, text).await;
     }
 
     /// Sprint 1 Day 2 — outline-panel response. Looks up the cached parse
@@ -650,10 +703,22 @@ impl LanguageServer for Backend {
             let name = sym_node.utf8_text(state.text.as_bytes()).ok()?;
             let scope = index::cursor_scope(sym_node, &state.text);
 
-            let def = file_index.resolve_def(name, scope.as_deref())?;
+            // Try per-file index first.
+            if let Some(def) = file_index.resolve_def(name, scope.as_deref()) {
+                return Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: uri.clone(),
+                    range: def.name_range,
+                }));
+            }
 
+            // Sprint 4 — fall back to workspace index (cross-file).
+            let workspace = state.workspace_index.as_ref()?;
+            let entry = workspace.resolve_global(name)?;
+            let origin_path = &entry.0;
+            let def = &entry.1;
+            let target_uri = Url::from_file_path(origin_path).ok()?;
             Some(GotoDefinitionResponse::Scalar(Location {
-                uri: uri.clone(),
+                uri: target_uri,
                 range: def.name_range,
             }))
         })();
@@ -729,6 +794,9 @@ impl LanguageServer for Backend {
     ///   `@…`  → AutoIt built-in macros.
     ///   letter → user-defined functions + 3,542 AutoIt built-in functions.
     ///
+    /// Sprint 4 — `#include` path completion: `#include "…"` and
+    /// `#include <…>` directives get file/directory completions from disk.
+    ///
     /// Returns an empty list when the cursor is inside a string or comment —
     /// detected by checking the tree-sitter node kind at the cursor position.
     async fn completion(
@@ -738,11 +806,27 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
+        // Extract include_dir before the docs lock — needed inside the closure.
+        let autoit_include_dir = self.inner.autoit_include_dir.clone();
+
         let docs = self.inner.docs.read().await;
         let result = (|| -> Option<CompletionResponse> {
             let state = docs.get(&uri)?;
             let tree = state.tree.as_ref()?;
             let file_index = state.index.as_ref()?;
+
+            // Sprint 4 — check for include-path completion context first.
+            // Uses a line-based scan so it works even with partial/malformed
+            // `#include` lines that tree-sitter has error-recovered.
+            if let Ok(path) = uri.to_file_path() {
+                if let Some(ctx) =
+                    includes::detect_include_context(&state.text, position, &path)
+                {
+                    let items =
+                        includes::include_path_completions(&ctx, autoit_include_dir.as_deref());
+                    return Some(CompletionResponse::Array(items));
+                }
+            }
 
             // Determine the partial token at the cursor. We walk back from
             // the cursor column to find the start of the current word.
@@ -765,11 +849,14 @@ impl LanguageServer for Backend {
             // survives any parse-error recovery intact.
             let cursor_scope = index::scope_at_line(file_index, position.line);
 
+            let workspace = state.workspace_index.as_ref();
+
             let items = complete::completions_at(
                 &prefix,
                 file_index,
                 cursor_scope.as_deref(),
                 in_noise,
+                workspace,
             );
 
             Some(CompletionResponse::Array(items))
@@ -874,11 +961,13 @@ async fn main() {
     register_autoit_run();
 
     let au3check = au3check::discover_au3check();
+    let autoit_include_dir = au3check::discover_autoit_include_dir();
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| Backend::new(client, au3check));
+    let (service, socket) =
+        LspService::new(|client| Backend::new(client, au3check, autoit_include_dir));
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 
