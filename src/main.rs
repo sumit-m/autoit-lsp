@@ -10,6 +10,7 @@
 
 mod au3check;
 mod builtins;
+mod codeaction;
 mod complete;
 mod doccomment;
 mod hints;
@@ -33,8 +34,8 @@ use serde::Deserialize;
 use tokio::sync::RwLock as AsyncRwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
-    CompletionOptions, CompletionParams, CompletionResponse, SignatureHelpOptions,
-    SignatureHelpParams, *,
+    CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CompletionOptions,
+    CompletionParams, CompletionResponse, SignatureHelpOptions, SignatureHelpParams, *,
 };
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
@@ -480,6 +481,10 @@ impl LanguageServer for Backend {
                 // Zed pulls hints for the visible viewport on every scroll /
                 // edit; we walk the tree and return one hint per argument.
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                // v0.5.0 — code actions: quick-fixes surfaced on diagnostic
+                // squiggles. Two kinds: add missing #include for UDF library
+                // functions, and fix function-name casing to the canonical form.
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..Default::default()
             },
         })
@@ -738,6 +743,40 @@ impl LanguageServer for Backend {
             state.workspace_index.as_ref(),
         );
         Ok(Some(hints))
+    }
+
+    /// v0.5.0 — code actions. Returns quick-fix actions for the diagnostics
+    /// present on the current line/range:
+    ///   • "Add #include <Lib.au3>" — when the identifier is a UDF library
+    ///     function whose include directive is missing from the file.
+    ///   • "Fix casing: `name` → `Name`" — when the identifier matches a
+    ///     catalog entry case-insensitively but uses the wrong spelling.
+    async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri.clone();
+        let docs = self.inner.docs.read().await;
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        let actions = codeaction::code_actions_for(
+            &uri,
+            params.range,
+            &params.context.diagnostics,
+            &state.text,
+            state.tree.as_ref(),
+        );
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(
+                actions
+                    .into_iter()
+                    .map(CodeActionOrCommand::CodeAction)
+                    .collect(),
+            ))
+        }
     }
 
     /// Sprint 2 — go-to-definition. Resolves the symbol under the cursor
