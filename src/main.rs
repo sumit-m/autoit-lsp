@@ -666,7 +666,13 @@ impl LanguageServer for Backend {
         let Some(tree) = state.tree.as_ref() else {
             return Ok(None);
         };
-        Ok(hover::hover_for(tree, &state.text, position))
+        Ok(hover::hover_for(
+            tree,
+            &state.text,
+            position,
+            state.index.as_ref(),
+            state.workspace_index.as_ref(),
+        ))
     }
 
     /// Sprint 2 — go-to-definition. Resolves the symbol under the cursor
@@ -726,10 +732,15 @@ impl LanguageServer for Backend {
         Ok(result)
     }
 
-    /// Sprint 2 — find-references. Returns all usage sites of the symbol
-    /// under the cursor, scope-filtered to match the definition's visibility:
-    /// globals/functions return file-wide refs; locals/params return only
-    /// refs inside their declaring function.
+    /// Find-references. Returns all usage sites of the symbol under the cursor,
+    /// scope-filtered to match the definition's visibility:
+    ///   - Locals/params → refs only inside their declaring function (current file).
+    ///   - Globals/functions → refs in the current file **plus** refs across all
+    ///     transitively included files (Sprint 4 workspace index).
+    ///
+    /// Falls back gracefully when the symbol is defined in an included file
+    /// (not the current file): the workspace index supplies the definition scope
+    /// so current-file and cross-file refs are still collected correctly.
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
@@ -757,14 +768,34 @@ impl LanguageServer for Backend {
             let name = sym_node.utf8_text(state.text.as_bytes()).ok()?;
             let cursor_scope = index::cursor_scope(sym_node, &state.text);
 
-            // Resolve the definition first so we know its scope, which
-            // determines the ref-filtering strategy.
-            let def = file_index.resolve_def(name, cursor_scope.as_deref())?;
-            let def_scope = def.scope_func.as_deref();
+            // Resolve the definition to determine its scope and declaration
+            // location. Try the current file first; fall back to the workspace
+            // index for symbols defined in included files.
+            let (def_scope, decl_location) =
+                if let Some(def) = file_index.resolve_def(name, cursor_scope.as_deref()) {
+                    let loc = Location {
+                        uri: uri.clone(),
+                        range: def.name_range,
+                    };
+                    (def.scope_func.clone(), Some(loc))
+                } else if let Some(ws) = state.workspace_index.as_ref() {
+                    if let Some(entry) = ws.resolve_global(name) {
+                        let target_uri = Url::from_file_path(&entry.0).ok()?;
+                        let loc = Location {
+                            uri: target_uri,
+                            range: entry.1.name_range,
+                        };
+                        (None, Some(loc)) // workspace defs are always file-global
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                };
 
-            let refs = file_index.find_refs(name, def_scope);
-
-            let mut locations: Vec<Location> = refs
+            // Current-file refs, filtered by the resolved scope.
+            let file_refs = file_index.find_refs(name, def_scope.as_deref());
+            let mut locations: Vec<Location> = file_refs
                 .iter()
                 .map(|r| Location {
                     uri: uri.clone(),
@@ -772,14 +803,27 @@ impl LanguageServer for Backend {
                 })
                 .collect();
 
+            // Cross-file refs — only meaningful for global symbols (no scope).
+            // The workspace index stores ref sites from all included files;
+            // the entry file itself is excluded from the workspace so there
+            // is no overlap with the current-file refs above.
+            if def_scope.is_none() {
+                if let Some(ws) = state.workspace_index.as_ref() {
+                    for (path, r) in ws.refs_for(name) {
+                        if let Ok(ref_uri) = Url::from_file_path(path) {
+                            locations.push(Location {
+                                uri: ref_uri,
+                                range: r.usage_range,
+                            });
+                        }
+                    }
+                }
+            }
+
             if include_decl {
-                locations.insert(
-                    0,
-                    Location {
-                        uri: uri.clone(),
-                        range: def.name_range,
-                    },
-                );
+                if let Some(loc) = decl_location {
+                    locations.insert(0, loc);
+                }
             }
 
             Some(locations)

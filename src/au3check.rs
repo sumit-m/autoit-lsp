@@ -140,6 +140,12 @@ pub async fn run_au3check(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// True if `b` can appear in an AutoIt identifier: alphanumeric, `_`, `$`, `@`, `.`.
+#[inline]
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'@' || b == b'.'
+}
+
 /// Walk forward from `col0` in `line` while the byte is part of an
 /// identifier / sigil-prefixed name. Returns the end column (one past
 /// the last identifier byte).
@@ -156,13 +162,7 @@ fn token_end_col(line: &str, col0: u32) -> u32 {
         return col0 + 1;
     }
     let mut end = start;
-    while end < bytes.len() {
-        let b = bytes[end];
-        let is_token =
-            b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'@' || b == b'.';
-        if !is_token {
-            break;
-        }
+    while end < bytes.len() && is_ident_byte(bytes[end]) {
         end += 1;
     }
     if end == start {
@@ -208,38 +208,63 @@ fn extract_leading_identifier(msg: &str) -> Option<&str> {
 }
 
 /// Compute the start/end column of the diagnostic range, in 0-based
-/// LSP column units. Three-tier fallback:
+/// LSP column units. Four-tier fallback:
 ///
-/// 1. Walk forward from `col0` across identifier characters. If the
-///    walk produces a multi-character range, use it (the diagnostic
-///    landed on an identifier — happy path).
-/// 2. Extract a leading identifier from the diagnostic message and
-///    locate it in the line. Use that range (catches Au3Check's
-///    habit of positioning some diagnostics past the offending
-///    token, like `undefined function.` after the closing paren).
-/// 3. Single character at `col0` (worst-case fallback — Au3Check
-///    reported a column we can't enrich).
+/// 1. **Forward walk** from `col0`: Au3Check landed on the *first* byte of
+///    the offending token → walk right and return the full span.
+/// 2. **Backward walk** from `col0`: Au3Check landed on the *last* byte of
+///    the offending token (e.g. "Statement cannot be just an expression."
+///    for a bare `$var` or `@MACRO`) → walk left to find the token start,
+///    confirm with a forward walk from there.
+/// 3. **Message-based lookup**: extract the leading identifier from the
+///    diagnostic message and find it in the line (catches Au3Check's habit
+///    of positioning "undefined function" diagnostics past the closing
+///    paren — both forward and backward walks fail there).
+/// 4. **Single character** at `col0` (worst-case fallback).
 ///
 /// Returns `(start_col, end_col)` so callers can build an LSP Range.
 fn diagnostic_range(line: &str, col0: u32, msg: &str) -> (u32, u32) {
-    // Try 1: forward walk from col0.
-    if (col0 as usize) < line.len() {
+    let bytes = line.as_bytes();
+
+    // Tier 1: forward walk. Handles identifiers whose first char is reported.
+    if (col0 as usize) < bytes.len() {
         let end = token_end_col(line, col0);
         if end > col0 + 1 {
             return (col0, end);
         }
     }
-    // Try 2: message-based identifier lookup. Find the identifier
-    // anywhere in the line — use the first occurrence. (If the same
-    // name appears multiple times in one line, first match is the
-    // pragmatic choice; rare edge case where it matters.)
-    //
-    // Case-insensitive: AutoIt identifiers are case-insensitive, and
-    // Au3Check normalises function names to their canonical casing in
-    // diagnostic messages (e.g. emits `FileOpen` even when the source
-    // says `fileopen`). A case-sensitive `str::find` would miss the
-    // off-case spelling and fall to the single-char tier — that's
-    // visible as a squiggle on the `)` instead of the function name.
+
+    // Tier 2: backward walk.  Au3Check sometimes reports the LAST character
+    // of the offending token.  Example: bare `$components` on its own line
+    // gets "Statement cannot be just an expression." with col pointing at
+    // the trailing `s`.  Forward walk from `s` gives exactly 1 char (false),
+    // so we walk left instead, find the token start, then confirm forward.
+    {
+        // If col0 is past EOL treat it as pointing at the last valid byte.
+        let effective = if (col0 as usize) >= bytes.len() {
+            bytes.len().saturating_sub(1)
+        } else {
+            col0 as usize
+        };
+        if !bytes.is_empty() && is_ident_byte(bytes[effective]) {
+            let mut start = effective;
+            while start > 0 && is_ident_byte(bytes[start - 1]) {
+                start -= 1;
+            }
+            if start < effective {
+                // Backed up at least one byte — we're inside a multi-char token.
+                let end = token_end_col(line, start as u32);
+                if end > start as u32 + 1 {
+                    return (start as u32, end);
+                }
+            }
+        }
+    }
+
+    // Tier 3: message-based identifier lookup.
+    // Case-insensitive: Au3Check normalises function names to their canonical
+    // casing in messages (e.g. emits `FileOpen` even when source says
+    // `fileopen`).  A case-sensitive find would miss the off-case spelling.
     if let Some(id) = extract_leading_identifier(msg) {
         if let Some(byte_start) = find_ascii_case_insensitive(line, id) {
             let start = byte_start as u32;
@@ -247,7 +272,8 @@ fn diagnostic_range(line: &str, col0: u32, msg: &str) -> (u32, u32) {
             return (start, end);
         }
     }
-    // Try 3: single character at the reported column.
+
+    // Tier 4: single character at the reported column.
     (col0, col0 + 1)
 }
 
@@ -534,6 +560,38 @@ some other unrelated noise
     }
 
     #[test]
+    fn parse_diagnostics_backward_walk_for_bare_expression() {
+        // Reproduces the reported bug: bare `$components` on its own line.
+        // Au3Check reports col=11 (1-based) = the last character `s` (col0=10).
+        // The backward walk should expand the range to cover the full token.
+        let source = "$components\n";
+        let out = format!(
+            "\"{}\"(1,11) : error: Statement cannot be just an expression.\n",
+            target().to_string_lossy()
+        );
+        let diags = parse_diagnostics(&out, &target(), source);
+        assert_eq!(diags.len(), 1);
+        let d = &diags[0];
+        assert_eq!(d.range.start.character, 0);
+        assert_eq!(d.range.end.character, 11); // full `$components`
+    }
+
+    #[test]
+    fn parse_diagnostics_backward_walk_for_bare_macro() {
+        // Same for a bare `@CRLF` — col=5 (1-based) = last char `F` (col0=4).
+        let source = "@CRLF\n";
+        let out = format!(
+            "\"{}\"(1,5) : error: Statement cannot be just an expression.\n",
+            target().to_string_lossy()
+        );
+        let diags = parse_diagnostics(&out, &target(), source);
+        assert_eq!(diags.len(), 1);
+        let d = &diags[0];
+        assert_eq!(d.range.start.character, 0);
+        assert_eq!(d.range.end.character, 5); // full `@CRLF`
+    }
+
+    #[test]
     fn parse_diagnostics_single_char_when_no_msg_match() {
         // col0 on whitespace, message identifier not in line —
         // worst-case fallback: single character at reported col.
@@ -609,14 +667,34 @@ some other unrelated noise
     #[test]
     fn diagnostic_range_forward_walk_wins() {
         // col0 on an identifier — forward walk finds multi-char range,
-        // message lookup not consulted.
+        // backward walk and message lookup not consulted.
         let line = "Local $foobar = 5";
         let (s, e) = diagnostic_range(line, 6, "irrelevant msg");
         assert_eq!((s, e), (6, 13));
     }
 
     #[test]
+    fn diagnostic_range_backward_walk_at_end_of_variable() {
+        // Au3Check reports col at the LAST character of the offending token for
+        // "Statement cannot be just an expression." — e.g. a bare `$components`
+        // on its own line where col0 = 10 (the `s`, 0-based).
+        let line = "$components";
+        let (s, e) = diagnostic_range(line, 10, "Statement cannot be just an expression.");
+        assert_eq!((s, e), (0, 11));
+    }
+
+    #[test]
+    fn diagnostic_range_backward_walk_at_end_of_macro() {
+        // Same for a bare `@CRLF` — col0 = 4 (the `F`, last char, 0-based).
+        let line = "@CRLF";
+        let (s, e) = diagnostic_range(line, 4, "Statement cannot be just an expression.");
+        assert_eq!((s, e), (0, 5));
+    }
+
+    #[test]
     fn diagnostic_range_msg_lookup_at_eol() {
+        // Tier 3: backward walk fails (col past EOL lands on `)`, not ident),
+        // so message lookup finds the function name.
         let line = "ThisFunctionDoesNotExist(\"hello\")";
         let (s, e) = diagnostic_range(
             line,

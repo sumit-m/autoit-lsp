@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, InsertTextFormat, Position};
 
-use crate::index::{build_index, DefKind, FileIndex, SymbolDef};
+use crate::index::{build_index, DefKind, FileIndex, SymbolDef, SymbolRef};
 use crate::tree;
 
 const MAX_INCLUDE_FILES: usize = 200;
@@ -127,6 +127,10 @@ pub fn resolve_include(
 pub struct WorkspaceIndex {
     /// Lowercase name → `(origin_path, SymbolDef)` pairs.
     pub global_defs: HashMap<String, Vec<(PathBuf, SymbolDef)>>,
+    /// Lowercase name → all reference sites across included files.
+    /// Used by cross-file find-references to locate every usage of a
+    /// globally-visible symbol in the include tree.
+    pub global_refs: HashMap<String, Vec<(PathBuf, SymbolRef)>>,
     /// Number of included files processed.
     pub file_count: usize,
     /// `true` if the file-count or depth cap fired during resolution.
@@ -157,6 +161,16 @@ impl WorkspaceIndex {
                 DefKind::Variable | DefKind::Constant | DefKind::EnumMember
             )
         })
+    }
+
+    /// All reference sites for `name` across included files (case-insensitive).
+    /// Returns an empty slice when the name has no recorded references.
+    pub fn refs_for(&self, name: &str) -> &[(PathBuf, SymbolRef)] {
+        let key = name.to_lowercase();
+        self.global_refs
+            .get(&key)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -247,7 +261,7 @@ pub async fn build_workspace_index(
 
         // Build per-file index and harvest global defs.
         let file_index = build_index(&file_tree, &source);
-        harvest_globals(&path, &file_index, &mut index);
+        harvest_file_data(&path, &file_index, &mut index);
         index.file_count += 1;
 
         // Enqueue this file's includes.
@@ -276,8 +290,16 @@ pub async fn build_workspace_index(
     index
 }
 
-/// Copy all file-global defs from `file_index` into `workspace.global_defs`.
-fn harvest_globals(origin: &Path, file_index: &FileIndex, workspace: &mut WorkspaceIndex) {
+/// Copy all file-global defs and all reference sites from `file_index` into
+/// the workspace index.
+///
+/// **Defs**: only file-global symbols (`scope_func = None`) are harvested —
+/// locally-scoped defs are invisible outside their declaring file.
+///
+/// **Refs**: every reference site is harvested regardless of scope.  The
+/// cross-file find-references handler uses these to locate all usages of a
+/// globally-visible symbol across the full include tree.
+fn harvest_file_data(origin: &Path, file_index: &FileIndex, workspace: &mut WorkspaceIndex) {
     for (key, defs) in &file_index.defs {
         for def in defs {
             if def.scope_func.is_none() {
@@ -287,6 +309,15 @@ fn harvest_globals(origin: &Path, file_index: &FileIndex, workspace: &mut Worksp
                     .or_default()
                     .push((origin.to_path_buf(), def.clone()));
             }
+        }
+    }
+    for (key, refs) in &file_index.refs {
+        for r in refs {
+            workspace
+                .global_refs
+                .entry(key.clone())
+                .or_default()
+                .push((origin.to_path_buf(), r.clone()));
         }
     }
 }
@@ -540,16 +571,37 @@ mod tests {
     }
 
     #[test]
-    fn harvest_globals_only_takes_file_global_defs() {
+    fn harvest_file_data_only_takes_file_global_defs() {
         use crate::index::build_index;
         let source = "Global $g = 1\nFunc F()\n    Local $local = 2\nEndFunc\n";
         let tree = parse(source).expect("parse");
         let file_index = build_index(&tree, source);
         let mut ws = WorkspaceIndex::default();
-        harvest_globals(Path::new("test.au3"), &file_index, &mut ws);
+        harvest_file_data(Path::new("test.au3"), &file_index, &mut ws);
         // Global $g and Func F should be harvested; Local $local should NOT.
         assert!(ws.global_defs.contains_key("$g"), "$g should be in workspace");
         assert!(ws.global_defs.contains_key("f"), "F should be in workspace");
         assert!(!ws.global_defs.contains_key("$local"), "$local must not be in workspace");
+    }
+
+    #[test]
+    fn harvest_file_data_collects_refs() {
+        use crate::index::build_index;
+        let source = "Global $g = 1\nFunc F()\n    Return $g\nEndFunc\n";
+        let tree = parse(source).expect("parse");
+        let file_index = build_index(&tree, source);
+        let mut ws = WorkspaceIndex::default();
+        harvest_file_data(Path::new("test.au3"), &file_index, &mut ws);
+        // $g is used inside F — should appear in global_refs.
+        assert!(
+            !ws.refs_for("$g").is_empty(),
+            "$g should have at least one ref in the workspace"
+        );
+        // F is called at... well, not in this source, but the refs map should exist.
+        // At minimum global_refs for $g should have an entry.
+        assert!(
+            ws.refs_for("$g").iter().all(|(_, r)| r.usage_range.start.line > 0),
+            "the ref to $g should be inside function F (line > 0)"
+        );
     }
 }

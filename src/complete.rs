@@ -110,33 +110,29 @@ fn variable_completions(
                 _ => CompletionItemKind::VARIABLE,
             };
 
+            // `$` is a trigger character, so Zed positions the insertion point
+            // *right after the `$`* and keeps it in place.  If `insertText`
+            // includes the `$`, the result is `$$name`.  Strip the sigil so
+            // the editor inserts only `name` after the already-typed `$`.
+            // The `label` retains `$name` for correct display in the popup.
+            let insert = def.display_name.trim_start_matches('$').to_string();
+
             Some(CompletionItem {
                 label: def.display_name.clone(),
                 kind: Some(kind),
+                insert_text: Some(insert),
+                insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
                 ..Default::default()
             })
         })
         .collect();
 
-    // Workspace globals from included files — always visible, prefix-filtered.
-    if let Some(ws) = workspace {
-        for entry in ws.all_variables() {
-            let def = &entry.1;
-            let key = def.display_name.to_lowercase();
-            if key.starts_with(prefix) {
-                let kind = match def.kind {
-                    DefKind::Constant | DefKind::EnumMember => CompletionItemKind::CONSTANT,
-                    _ => CompletionItemKind::VARIABLE,
-                };
-                items.push(CompletionItem {
-                    label: def.display_name.clone(),
-                    kind: Some(kind),
-                    detail: Some("(included)".into()),
-                    ..Default::default()
-                });
-            }
-        }
-    }
+    // Cross-file variable/constant completions are intentionally excluded.
+    // `$` completions are scoped to the current file only — showing constants
+    // from every included library file produces too much noise for a sigil that
+    // users expect to reflect their own symbols. Functions from included files
+    // still appear on the letter-prefix path (see `function_completions`).
+    let _ = workspace; // workspace arg kept for future opt-in or per-setting use
 
     items.sort_by(|a, b| a.label.cmp(&b.label));
     items.truncate(MAX_ITEMS);
@@ -153,9 +149,10 @@ fn macro_completions(prefix: &str) -> Vec<CompletionItem> {
             label: m.name.to_string(),
             kind: Some(CompletionItemKind::CONSTANT),
             detail: Some(m.description.to_string()),
-            // Insert without the leading `@` when the user already typed it,
-            // but include it in the label so it reads correctly in the popup.
-            insert_text: Some(m.name.to_string()),
+            // `@` is a trigger character: Zed keeps the `@` in place and
+            // inserts after it.  Strip the leading `@` from insertText so
+            // the result is `@CRLF` not `@@CRLF`.
+            insert_text: Some(m.name.trim_start_matches('@').to_string()),
             insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
             ..Default::default()
         })

@@ -51,6 +51,11 @@ pub struct SymbolDef {
     /// `None` = file-global scope.
     /// `Some("funcname")` = local to that function (lowercase key).
     pub scope_func: Option<String>,
+    /// For `Function` defs only: the trimmed `Func Name(params...)` declaration
+    /// line from the source text. Populated by `collect_function_decl` so that
+    /// hover can show the signature without needing the original source buffer.
+    /// `None` for all non-function def kinds.
+    pub signature_line: Option<String>,
 }
 
 /// One usage (reference) of a named symbol.
@@ -246,6 +251,13 @@ fn collect_function_decl(node: Node, source: &str, index: &mut FileIndex) {
     };
     let key = name.to_lowercase();
 
+    // Extract the `Func Name(...)` declaration line for use in hover popups.
+    // Trimmed to remove leading indentation (nested Funcs are unusual but legal).
+    let sig_line = source
+        .lines()
+        .nth(node.start_position().row)
+        .map(|l| l.trim().to_string());
+
     // Function definitions are file-global (scope_func = None).
     index.defs.entry(key.clone()).or_default().push(SymbolDef {
         display_name: name.clone(),
@@ -253,6 +265,7 @@ fn collect_function_decl(node: Node, source: &str, index: &mut FileIndex) {
         full_range: node_range(&node, source),
         name_range: node_range(&name_node, source),
         scope_func: None,
+        signature_line: sig_line,
     });
 
     // Parameters — scoped to this function.
@@ -275,6 +288,7 @@ fn collect_function_decl(node: Node, source: &str, index: &mut FileIndex) {
                         full_range: node_range(&param, source),
                         name_range: node_range(&pname_node, source),
                         scope_func: Some(key.clone()),
+                        signature_line: None,
                     });
                 }
             }
@@ -331,6 +345,7 @@ fn collect_decl_stmt(node: Node, source: &str, scope_func: Option<&str>, index: 
             full_range: node_range(&child, source),
             name_range: node_range(&name_node, source),
             scope_func: scope_func.map(String::from),
+            signature_line: None,
         });
 
         // Recurse into the value expression (RHS), skipping the name node
@@ -370,6 +385,7 @@ fn collect_enum_decl(node: Node, source: &str, scope_func: Option<&str>, index: 
             full_range: node_range(&child, source),
             name_range: node_range(&name_node, source),
             scope_func: scope_func.map(String::from),
+            signature_line: None,
         });
     }
 }

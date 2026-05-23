@@ -1,7 +1,6 @@
-//! Hover responses for AutoIt builtin and UDF library functions.
+//! Hover responses for AutoIt functions — both built-in and user-defined.
 //!
-//! Looks up the identifier under the cursor in the static [`builtins`]
-//! catalog and formats a Markdown response:
+//! **Built-in / UDF library functions** (static catalog, ~3,542 entries):
 //!
 //! ```text
 //! ```autoit
@@ -13,46 +12,140 @@
 //!
 //! **Parameters:**
 //! - `$aArray` — Array to modify
-//! - `$vValue` — Value(s) to add
 //!
-//! **Returns:** Success: the index of last added item. Failure: -1.
+//! **Returns:** Success: the index of last added item.
 //! ```
 //!
-//! Sprint 1 deliberately handles only `identifier` nodes (function names).
-//! Variables, macros (`@CRLF`), and member access fall through to no hover
-//! — they need a symbol index or macro table which is Sprint 2+ work.
+//! **User-defined functions** (from the per-file index or workspace index):
+//!
+//! ```text
+//! ```autoit
+//! Func MyHelper($a, $b = 0)
+//! ```
+//!
+//! *(User-defined function)*
+//! ```
+//!
+//! Lookup priority:
+//! 1. AutoIt built-in / UDF library (static catalog)
+//! 2. User-defined function in the current file (`file_index`)
+//! 3. User-defined function in an included file (`workspace`)
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 use tree_sitter::Tree;
 
 use crate::builtins::{self, FunctionDoc};
+use crate::includes::WorkspaceIndex;
+use crate::index::{DefKind, FileIndex, SymbolDef};
 use crate::tree::{node_at_position, node_range};
 
 /// Compute the hover response, if any, for `position` in `source` (parsed
-/// into `tree`). Returns `None` when the cursor isn't on a recognized
-/// identifier or when that identifier isn't in the builtin catalog.
-pub fn hover_for(tree: &Tree, source: &str, position: Position) -> Option<Hover> {
+/// into `tree`).
+///
+/// Lookup priority:
+/// 1. AutoIt built-in / UDF library (static catalog, ~3,542 entries)
+/// 2. User-defined function in the current file (`file_index`)
+/// 3. User-defined function in an included file (`workspace`)
+///
+/// Returns `None` when the cursor isn't on an identifier or the identifier
+/// isn't found in any of the three sources.
+pub fn hover_for(
+    tree: &Tree,
+    source: &str,
+    position: Position,
+    file_index: Option<&FileIndex>,
+    workspace: Option<&WorkspaceIndex>,
+) -> Option<Hover> {
     let node = node_at_position(tree, source, position)?;
-    // Only identifier nodes carry a builtin reference. Other leaf kinds
-    // (keywords, operators, string content, variables) aren't builtin
-    // function names by construction.
+    // Only identifier nodes carry function names. Other leaf kinds
+    // (keywords, operators, strings, variables) are not function names.
     if node.kind() != "identifier" {
         return None;
     }
     let name = node.utf8_text(source.as_bytes()).ok()?;
-    let doc = builtins::lookup(name)?;
+    let node_rng = node_range(&node, source);
 
-    Some(Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: format_markdown(doc),
-        }),
-        // Highlighting the identifier range tells the client to underline
-        // exactly the matched token (rather than guessing the word boundary).
-        range: Some(node_range(&node, source)),
-    })
+    // 1. Built-in / UDF library catalog.
+    if let Some(doc) = builtins::lookup(name) {
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format_markdown(doc),
+            }),
+            range: Some(node_rng),
+        });
+    }
+
+    // 2. User-defined function in the current file.
+    if let Some(idx) = file_index {
+        if let Some(def) = idx.resolve_def(name, None) {
+            if def.kind == DefKind::Function {
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format_udf_hover(def, None),
+                    }),
+                    range: Some(node_rng),
+                });
+            }
+        }
+    }
+
+    // 3. User-defined function in an included file.
+    if let Some(ws) = workspace {
+        if let Some(entry) = ws.resolve_global(name) {
+            if entry.1.kind == DefKind::Function {
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format_udf_hover(&entry.1, Some(&entry.0)),
+                    }),
+                    range: Some(node_rng),
+                });
+            }
+        }
+    }
+
+    None
+}
+
+/// Render a user-defined function as a hover popup.
+///
+/// Shows the `Func Name(params...)` declaration line in a code fence, plus
+/// a provenance note — "*(User-defined function)*" for in-file functions or
+/// "*(Defined in `filename.au3`)*" for functions from included files.
+fn format_udf_hover(def: &SymbolDef, origin: Option<&Path>) -> String {
+    let mut out = String::with_capacity(256);
+
+    out.push_str("```autoit\n");
+    match &def.signature_line {
+        Some(sig) => {
+            out.push_str(sig);
+            out.push('\n');
+        }
+        None => {
+            // Defensive fallback — should not occur for Function defs built
+            // by collect_function_decl, but guards against future refactors.
+            let _ = write!(out, "Func {}(...)\n", def.display_name);
+        }
+    }
+    out.push_str("```\n");
+
+    match origin {
+        None => out.push_str("\n*(User-defined function)*\n"),
+        Some(path) => {
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            let _ = write!(out, "\n*(Defined in `{filename}`)*\n");
+        }
+    }
+
+    out
 }
 
 /// Render a FunctionDoc as the body of a hover popup. Markdown so Zed can
@@ -132,6 +225,7 @@ fn bullet_continuation(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::build_index;
     use crate::tree::parse;
 
     #[test]
@@ -139,7 +233,7 @@ mod tests {
         let source = "MsgBox(0, \"title\", \"text\")\n";
         let tree = parse(source).unwrap();
         // 'M' of "MsgBox" is at col 0; cursor at col 2 lands inside.
-        let hover = hover_for(&tree, source, Position::new(0, 2))
+        let hover = hover_for(&tree, source, Position::new(0, 2), None, None)
             .expect("expected a hover response for MsgBox");
         let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents else {
             panic!("expected Markup hover contents");
@@ -156,7 +250,7 @@ mod tests {
         // should follow suit so `msgbox(...)` shows MsgBox docs.
         let source = "msgbox(0, \"t\", \"x\")\n";
         let tree = parse(source).unwrap();
-        let hover = hover_for(&tree, source, Position::new(0, 2));
+        let hover = hover_for(&tree, source, Position::new(0, 2), None, None);
         assert!(hover.is_some(), "case-insensitive lookup should still match");
     }
 
@@ -164,7 +258,7 @@ mod tests {
     fn hover_on_unknown_identifier_returns_none() {
         let source = "MyCustomFunction()\n";
         let tree = parse(source).unwrap();
-        assert!(hover_for(&tree, source, Position::new(0, 2)).is_none());
+        assert!(hover_for(&tree, source, Position::new(0, 2), None, None).is_none());
     }
 
     #[test]
@@ -174,16 +268,16 @@ mod tests {
         let source = "Func F($x)\nEndFunc\n";
         let tree = parse(source).unwrap();
         // Position 0 = 'F' of "Func" — a keyword.
-        assert!(hover_for(&tree, source, Position::new(0, 0)).is_none());
+        assert!(hover_for(&tree, source, Position::new(0, 0), None, None).is_none());
         // Position 7 = '$' of "$x" — a variable.
-        assert!(hover_for(&tree, source, Position::new(0, 7)).is_none());
+        assert!(hover_for(&tree, source, Position::new(0, 7), None, None).is_none());
     }
 
     #[test]
     fn hover_markdown_has_expected_sections() {
         let source = "ConsoleWrite(\"hi\")\n";
         let tree = parse(source).unwrap();
-        let hover = hover_for(&tree, source, Position::new(0, 2))
+        let hover = hover_for(&tree, source, Position::new(0, 2), None, None)
             .expect("ConsoleWrite should resolve");
         let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents else {
             panic!();
@@ -192,5 +286,64 @@ mod tests {
         // Returns sections — ConsoleWrite has both.
         assert!(value.contains("```autoit"));
         assert!(value.contains("**Parameters:**") || value.contains("**Returns:**"));
+    }
+
+    // ── User-defined function hover ───────────────────────────────────────────
+
+    #[test]
+    fn hover_on_user_defined_function_shows_signature() {
+        let source =
+            "Func MyHelper($a, $b = 0)\n    Return $a + $b\nEndFunc\n\nMyHelper(1, 2)\n";
+        let tree = parse(source).unwrap();
+        let file_idx = build_index(&tree, source);
+        // Cursor at col 2 of line 4 ("MyHelper(1, 2)") — the call site.
+        let hover = hover_for(&tree, source, Position::new(4, 2), Some(&file_idx), None)
+            .expect("UDF hover should be returned for a defined function");
+        let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents else {
+            panic!("expected Markup");
+        };
+        assert!(value.contains("```autoit"), "should use a code fence");
+        assert!(
+            value.contains("MyHelper"),
+            "signature should mention the function name"
+        );
+        assert!(
+            value.contains("*(User-defined function)*"),
+            "in-file UDF should have the provenance note"
+        );
+    }
+
+    #[test]
+    fn hover_on_udf_definition_itself_shows_signature() {
+        // Hovering directly on the Func keyword's identifier (the function
+        // name in the declaration) should also return the signature.
+        let source = "Func Calculate($x)\n    Return $x * 2\nEndFunc\n";
+        let tree = parse(source).unwrap();
+        let file_idx = build_index(&tree, source);
+        // Line 0 col 5 = 'C' of "Calculate" in the Func declaration.
+        let hover =
+            hover_for(&tree, source, Position::new(0, 5), Some(&file_idx), None);
+        assert!(hover.is_some(), "hover on the func name node should work");
+    }
+
+    #[test]
+    fn hover_builtin_takes_priority_over_udf_with_same_name() {
+        // If somehow a UDF shadows a builtin name, the builtin catalog wins.
+        // (In practice, AutoIt allows re-defining builtins, but we show
+        // the canonical docs regardless.)
+        let source = "Func MsgBox($f, $t, $b)\nEndFunc\nMsgBox(0, \"\", \"\")\n";
+        let tree = parse(source).unwrap();
+        let file_idx = build_index(&tree, source);
+        // Cursor on the call site "MsgBox" at line 2.
+        let hover = hover_for(&tree, source, Position::new(2, 2), Some(&file_idx), None)
+            .expect("should return builtin docs even when name is shadowed");
+        let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents else {
+            panic!();
+        };
+        // The builtin result will have a docs link; UDF result would not.
+        assert!(
+            value.contains("autoitscript.com"),
+            "should show builtin docs, not UDF hover"
+        );
     }
 }
