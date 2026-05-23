@@ -134,6 +134,16 @@ fn format_udf_hover(def: &SymbolDef, origin: Option<&Path>) -> String {
     }
     out.push_str("```\n");
 
+    // Doc comment (if present) rendered between the signature fence and the
+    // provenance footnote.
+    if let Some(doc) = &def.doc_comment {
+        out.push('\n');
+        out.push_str(doc);
+        if !doc.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+
     match origin {
         None => out.push_str("\n*(User-defined function)*\n"),
         Some(path) => {
@@ -345,5 +355,68 @@ mod tests {
             value.contains("autoitscript.com"),
             "should show builtin docs, not UDF hover"
         );
+    }
+
+    // ── Doc-comment hover ─────────────────────────────────────────────────────
+
+    #[test]
+    fn hover_shows_plain_doc_comment() {
+        let source = concat!(
+            "; Calculates the sum of two numbers.\n",
+            "Func Add($a, $b)\n",
+            "    Return $a + $b\n",
+            "EndFunc\n",
+            "\n",
+            "Add(1, 2)\n",
+        );
+        let tree = parse(source).unwrap();
+        let file_idx = build_index(&tree, source);
+        let hover = hover_for(&tree, source, Position::new(5, 1), Some(&file_idx), None)
+            .expect("should hover");
+        let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents else {
+            panic!();
+        };
+        assert!(
+            value.contains("Calculates the sum of two numbers."),
+            "plain doc comment should appear in hover"
+        );
+    }
+
+    #[test]
+    fn hover_shows_autodoc_description_and_params() {
+        let source = concat!(
+            "; Description ...: Adds a value to an array\n",
+            "; Parameters ....: $arr - The array\n",
+            ";                  $val - The value\n",
+            "Func MyAdd($arr, $val)\n",
+            "EndFunc\n",
+            "\n",
+            "MyAdd(1, 2)\n",
+        );
+        let tree = parse(source).unwrap();
+        let file_idx = build_index(&tree, source);
+        let hover = hover_for(&tree, source, Position::new(6, 1), Some(&file_idx), None)
+            .expect("should hover");
+        let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents else {
+            panic!();
+        };
+        assert!(value.contains("Adds a value to an array"));
+        assert!(value.contains("**Parameters:**"));
+        assert!(value.contains("`$arr`"));
+    }
+
+    #[test]
+    fn hover_udf_without_doc_comment_still_works() {
+        // Functions with no preceding comment should still show the signature.
+        let source = "Func Bare()\nEndFunc\n\nBare()\n";
+        let tree = parse(source).unwrap();
+        let file_idx = build_index(&tree, source);
+        let hover = hover_for(&tree, source, Position::new(3, 1), Some(&file_idx), None)
+            .expect("should hover");
+        let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents else {
+            panic!();
+        };
+        assert!(value.contains("Bare"));
+        assert!(value.contains("*(User-defined function)*"));
     }
 }

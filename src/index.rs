@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use tower_lsp::lsp_types::Range;
 use tree_sitter::{Node, Tree};
 
+use crate::doccomment::extract_doc_comment;
+
 use crate::tree::node_range;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -56,6 +58,11 @@ pub struct SymbolDef {
     /// hover can show the signature without needing the original source buffer.
     /// `None` for all non-function def kinds.
     pub signature_line: Option<String>,
+    /// For `Function` defs only: Markdown-formatted doc comment extracted from
+    /// the `;`-comment block immediately preceding the `Func` keyword.
+    /// Supports both AutoDoc structured format and plain leading comments.
+    /// `None` when no comment block is found or for non-function def kinds.
+    pub doc_comment: Option<String>,
 }
 
 /// One usage (reference) of a named symbol.
@@ -253,10 +260,14 @@ fn collect_function_decl(node: Node, source: &str, index: &mut FileIndex) {
 
     // Extract the `Func Name(...)` declaration line for use in hover popups.
     // Trimmed to remove leading indentation (nested Funcs are unusual but legal).
+    let func_start_line = node.start_position().row;
     let sig_line = source
         .lines()
-        .nth(node.start_position().row)
+        .nth(func_start_line)
         .map(|l| l.trim().to_string());
+
+    // Extract the doc-comment block immediately preceding the Func keyword.
+    let doc = extract_doc_comment(source, func_start_line);
 
     // Function definitions are file-global (scope_func = None).
     index.defs.entry(key.clone()).or_default().push(SymbolDef {
@@ -266,6 +277,7 @@ fn collect_function_decl(node: Node, source: &str, index: &mut FileIndex) {
         name_range: node_range(&name_node, source),
         scope_func: None,
         signature_line: sig_line,
+        doc_comment: doc,
     });
 
     // Parameters — scoped to this function.
@@ -289,6 +301,7 @@ fn collect_function_decl(node: Node, source: &str, index: &mut FileIndex) {
                         name_range: node_range(&pname_node, source),
                         scope_func: Some(key.clone()),
                         signature_line: None,
+                        doc_comment: None,
                     });
                 }
             }
@@ -346,6 +359,7 @@ fn collect_decl_stmt(node: Node, source: &str, scope_func: Option<&str>, index: 
             name_range: node_range(&name_node, source),
             scope_func: scope_func.map(String::from),
             signature_line: None,
+            doc_comment: None,
         });
 
         // Recurse into the value expression (RHS), skipping the name node
@@ -386,6 +400,7 @@ fn collect_enum_decl(node: Node, source: &str, scope_func: Option<&str>, index: 
             name_range: node_range(&name_node, source),
             scope_func: scope_func.map(String::from),
             signature_line: None,
+            doc_comment: None,
         });
     }
 }

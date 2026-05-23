@@ -11,6 +11,7 @@
 mod au3check;
 mod builtins;
 mod complete;
+mod doccomment;
 mod hover;
 mod includes;
 mod index;
