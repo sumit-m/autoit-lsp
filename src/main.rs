@@ -149,6 +149,12 @@ struct Inner {
     /// `#include <Library.au3>` resolution. `None` on non-Windows or
     /// when AutoIt isn't installed.
     autoit_include_dir: Option<PathBuf>,
+    /// `AutoIt3.exe` — interpreter used to run AutoIt3Wrapper /Tidy.
+    autoit3_exe: Option<PathBuf>,
+    /// `AutoIt3Wrapper.au3` — SciTE4AutoIt3 script providing /Tidy.
+    autoit3wrapper: Option<PathBuf>,
+    /// `Tidy.exe` — the actual formatter binary AutoIt3Wrapper calls.
+    tidy_exe: Option<PathBuf>,
     /// All server-wide settings. `std::sync::RwLock` is fine because
     /// we never hold the lock across an await.
     settings: RwLock<Settings>,
@@ -168,12 +174,18 @@ impl Backend {
         client: Client,
         au3check: Option<PathBuf>,
         autoit_include_dir: Option<PathBuf>,
+        autoit3_exe: Option<PathBuf>,
+        autoit3wrapper: Option<PathBuf>,
+        tidy_exe: Option<PathBuf>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 client,
                 au3check,
                 autoit_include_dir,
+                autoit3_exe,
+                autoit3wrapper,
+                tidy_exe,
                 settings: RwLock::new(Settings::default()),
                 docs: AsyncRwLock::new(HashMap::new()),
             }),
@@ -485,6 +497,16 @@ impl LanguageServer for Backend {
                 // squiggles. Two kinds: add missing #include for UDF library
                 // functions, and fix function-name casing to the canonical form.
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                // v0.5.0 — code formatting via AutoIt3Wrapper /Tidy.
+                // Only advertised when all three required binaries are present:
+                // AutoIt3.exe (driver), AutoIt3Wrapper.au3 (entry point), and
+                // Tidy.exe (the actual formatter AutoIt3Wrapper calls internally).
+                // Missing any one means formatting will fail, so we don't
+                // advertise the capability at all in that case.
+                document_formatting_provider: (self.inner.autoit3_exe.is_some()
+                    && self.inner.autoit3wrapper.is_some()
+                    && self.inner.tidy_exe.is_some())
+                .then_some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -777,6 +799,101 @@ impl LanguageServer for Backend {
                     .collect(),
             ))
         }
+    }
+
+    /// v0.5.0 — code formatting via AutoIt3Wrapper /Tidy.
+    ///
+    /// Writes the buffer to a temp file, runs:
+    ///   `AutoIt3.exe AutoIt3Wrapper.au3 /Tidy /in <tempfile>`
+    /// reads back the modified file, and returns a single whole-document
+    /// `TextEdit`.  No-op when:
+    ///   - `AutoIt3.exe` or `AutoIt3Wrapper.au3` are not found
+    ///   - Tidy produces no changes
+    ///   - Running on a non-Windows platform
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let Some(autoit3) = self.inner.autoit3_exe.clone() else {
+            return Ok(None);
+        };
+        let Some(wrapper) = self.inner.autoit3wrapper.clone() else {
+            tracing::warn!(
+                "AutoIt3Wrapper.au3 not found — formatting disabled. \
+                 Install SciTE4AutoIt3 to enable Tidy formatting."
+            );
+            return Ok(None);
+        };
+
+        let uri = params.text_document.uri;
+        let text = {
+            let docs = self.inner.docs.read().await;
+            let Some(state) = docs.get(&uri) else {
+                return Ok(None);
+            };
+            state.text.clone()
+        };
+
+        // Stage the buffer to a temp .au3 file.
+        let temp_path = match staging::stage_buffer(&uri, &text).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "formatting: failed to stage buffer");
+                return Ok(None);
+            }
+        };
+
+        // Run: AutoIt3.exe AutoIt3Wrapper.au3 /Tidy /in <tempfile>
+        let source_dir = staging::original_dir(&uri);
+        let mut cmd = tokio::process::Command::new(&autoit3);
+        cmd.arg(&wrapper).arg("/Tidy").arg("/in").arg(&temp_path);
+        if let Some(dir) = source_dir {
+            cmd.current_dir(dir);
+        }
+
+        match cmd.output().await {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                tracing::warn!(
+                    status = ?out.status,
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "AutoIt3Wrapper /Tidy exited with non-zero status"
+                );
+                return Ok(None);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "AutoIt3Wrapper /Tidy failed to spawn");
+                return Ok(None);
+            }
+        }
+
+        // Read back the formatted file (Tidy modifies in-place).
+        let formatted = match tokio::fs::read_to_string(&temp_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "formatting: failed to read Tidy output");
+                return Ok(None);
+            }
+        };
+
+        // Clean up the .bak backup Tidy creates alongside the edited file.
+        let bak = format!("{}.bak", temp_path.display());
+        let _ = tokio::fs::remove_file(&bak).await;
+
+        // No-op if Tidy made no changes.
+        if formatted == text {
+            return Ok(None);
+        }
+
+        // Single whole-document replace edit.
+        let end = tree::byte_to_position(&text, text.len());
+        Ok(Some(vec![TextEdit {
+            range: Range {
+                start: Position::new(0, 0),
+                end,
+            },
+            new_text: formatted,
+        }]))
     }
 
     /// Sprint 2 — go-to-definition. Resolves the symbol under the cursor
@@ -1110,12 +1227,16 @@ async fn main() {
 
     let au3check = au3check::discover_au3check();
     let autoit_include_dir = au3check::discover_autoit_include_dir();
+    let autoit3_exe = au3check::discover_autoit3_exe();
+    let autoit3wrapper = au3check::discover_autoit3wrapper();
+    let tidy_exe = au3check::discover_tidy_exe();
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) =
-        LspService::new(|client| Backend::new(client, au3check, autoit_include_dir));
+    let (service, socket) = LspService::new(|client| {
+        Backend::new(client, au3check, autoit_include_dir, autoit3_exe, autoit3wrapper, tidy_exe)
+    });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 

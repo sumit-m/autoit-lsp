@@ -109,6 +109,54 @@ pub fn discover_autoit_include_dir() -> Option<PathBuf> {
     candidate.is_dir().then_some(candidate)
 }
 
+/// Discover `AutoIt3.exe` — the interpreter used to drive
+/// `AutoIt3Wrapper.au3 /Tidy` for code formatting.
+/// Same registry/fallback search order as `discover_au3check`.
+pub fn discover_autoit3_exe() -> Option<PathBuf> {
+    if let Some(dir) = install_dir_from_registry() {
+        let candidate = dir.join("AutoIt3.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let fallback = PathBuf::from(r"C:\Program Files (x86)\AutoIt3\AutoIt3.exe");
+    fallback.is_file().then_some(fallback)
+}
+
+/// Discover `AutoIt3Wrapper.au3`, which ships with SciTE4AutoIt3 and
+/// provides the `/Tidy` code-formatting entry point.
+/// Returns `None` when only the base AutoIt3 installer is present
+/// (SciTE4AutoIt3 is a separate download).
+pub fn discover_autoit3wrapper() -> Option<PathBuf> {
+    if let Some(dir) = install_dir_from_registry() {
+        let candidate = dir.join(r"SciTE\AutoIt3Wrapper\AutoIt3Wrapper.au3");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let fallback = PathBuf::from(
+        r"C:\Program Files (x86)\AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.au3",
+    );
+    fallback.is_file().then_some(fallback)
+}
+
+/// Discover `Tidy.exe`, the actual formatter binary that
+/// `AutoIt3Wrapper.au3 /Tidy` calls internally.  Both
+/// `AutoIt3Wrapper.au3` and `Tidy.exe` must be present for formatting
+/// to work; checking both avoids advertising the capability on machines
+/// where SciTE4AutoIt3 is only partially installed.
+pub fn discover_tidy_exe() -> Option<PathBuf> {
+    if let Some(dir) = install_dir_from_registry() {
+        let candidate = dir.join(r"SciTE\Tidy\Tidy.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let fallback =
+        PathBuf::from(r"C:\Program Files (x86)\AutoIt3\SciTE\Tidy\Tidy.exe");
+    fallback.is_file().then_some(fallback)
+}
+
 /// Build the Au3Check argument list from a config. Extracted so unit
 /// tests can verify flag generation without spawning the actual
 /// process.
