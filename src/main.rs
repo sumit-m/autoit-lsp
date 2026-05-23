@@ -12,10 +12,12 @@ mod au3check;
 mod builtins;
 mod complete;
 mod doccomment;
+mod hints;
 mod hover;
 mod includes;
 mod index;
 mod macros;
+mod signature;
 mod staging;
 mod symbols;
 mod tree;
@@ -31,7 +33,8 @@ use serde::Deserialize;
 use tokio::sync::RwLock as AsyncRwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
-    CompletionOptions, CompletionParams, CompletionResponse, *,
+    CompletionOptions, CompletionParams, CompletionResponse, SignatureHelpOptions,
+    SignatureHelpParams, *,
 };
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
@@ -464,6 +467,19 @@ impl LanguageServer for Backend {
                     resolve_provider: Some(false),
                     ..Default::default()
                 }),
+                // v0.5.0 — signature help. Fires on `(` (new call) and `,`
+                // (moving to the next argument). Retrigger on `,` keeps the
+                // popup updated as the user steps through arguments.
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".into(), ",".into()]),
+                    retrigger_characters: Some(vec![",".into()]),
+                    work_done_progress_options: Default::default(),
+                }),
+                // v0.5.0 — inlay hints: always-visible parameter-name ghost
+                // text on existing call sites (e.g. `flag: 0, title: "Hi"`).
+                // Zed pulls hints for the visible viewport on every scroll /
+                // edit; we walk the tree and return one hint per argument.
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -674,6 +690,54 @@ impl LanguageServer for Backend {
             state.index.as_ref(),
             state.workspace_index.as_ref(),
         ))
+    }
+
+    /// v0.5.0 — signature help. Shows the active function's parameter list
+    /// in a popup as the user types inside a call expression, with the
+    /// currently-active argument highlighted.
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let docs = self.inner.docs.read().await;
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        let Some(tree) = state.tree.as_ref() else {
+            return Ok(None);
+        };
+        Ok(signature::signature_help_for(
+            tree,
+            &state.text,
+            position,
+            state.index.as_ref(),
+            state.workspace_index.as_ref(),
+        ))
+    }
+
+    /// v0.5.0 — inlay hints. Returns parameter-name labels for every call
+    /// expression in the viewport range whose function is known (builtin
+    /// catalog, current-file UDF, or workspace UDF).
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
+        let docs = self.inner.docs.read().await;
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        let Some(tree) = state.tree.as_ref() else {
+            return Ok(None);
+        };
+        let hints = hints::inlay_hints_for(
+            tree,
+            &state.text,
+            range,
+            state.index.as_ref(),
+            state.workspace_index.as_ref(),
+        );
+        Ok(Some(hints))
     }
 
     /// Sprint 2 — go-to-definition. Resolves the symbol under the cursor

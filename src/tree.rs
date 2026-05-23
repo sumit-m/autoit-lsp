@@ -116,7 +116,7 @@ pub fn node_range(node: &Node, source: &str) -> tower_lsp::lsp_types::Range {
 /// When `position.character` would land inside a surrogate pair, we round
 /// down to the start of the char (matches the "best effort" behaviour of
 /// most servers — surrogate-pair-splitting edits don't happen in practice).
-fn position_to_byte(source: &str, position: Position) -> Option<usize> {
+pub(crate) fn position_to_byte(source: &str, position: Position) -> Option<usize> {
     let target_line = position.line as usize;
     let target_char = position.character as usize;
 
