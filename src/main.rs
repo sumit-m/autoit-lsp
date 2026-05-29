@@ -13,6 +13,7 @@ mod builtins;
 mod codeaction;
 mod complete;
 mod doccomment;
+mod folding;
 mod highlight;
 mod hints;
 mod hover;
@@ -476,6 +477,12 @@ impl LanguageServer for Backend {
                 // FileIndex find-refs + cursor-scope logic; marks assignment
                 // targets as Write, other occurrences as Read.
                 document_highlight_provider: Some(OneOf::Left(true)),
+                // v0.6.0 — folding ranges. Tree-walk emits folds for functions,
+                // #region blocks, control-flow bodies, and block comments —
+                // notably fixing #region folding (zed#22703). Users must set
+                // languages.AutoIt.document_folding_ranges = "on" (default
+                // "off"); verified on Zed 1.4.4.
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 // Sprint 3 — completion. Trigger characters `$` and `@`
                 // fire the popup immediately when those sigils are typed;
                 // regular alpha input triggers via Zed's word-completion path.
@@ -1090,6 +1097,26 @@ impl LanguageServer for Backend {
             let tree = state.tree.as_ref()?;
             let file_index = state.index.as_ref()?;
             highlight::document_highlights(tree, &state.text, file_index, position)
+        })();
+
+        Ok(result)
+    }
+
+    /// v0.6.0 — folding ranges. Walks the parse tree and returns a fold for
+    /// every multi-line construct (functions, `#region` blocks, control-flow
+    /// bodies, block comments). Fixes `#region` folding which Zed's built-in
+    /// heuristics can't catch. Current-file only; no index needed.
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> Result<Option<Vec<FoldingRange>>> {
+        let uri = params.text_document.uri;
+
+        let docs = self.inner.docs.read().await;
+        let result = (|| -> Option<Vec<FoldingRange>> {
+            let state = docs.get(&uri)?;
+            let tree = state.tree.as_ref()?;
+            Some(folding::folding_ranges(tree, &state.text))
         })();
 
         Ok(result)
