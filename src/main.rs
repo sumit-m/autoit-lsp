@@ -14,6 +14,7 @@ mod codeaction;
 mod complete;
 mod doccomment;
 mod folding;
+mod format_diff;
 mod highlight;
 mod hints;
 mod hover;
@@ -906,20 +907,25 @@ impl LanguageServer for Backend {
         let bak = format!("{}.bak", temp_path.display());
         let _ = tokio::fs::remove_file(&bak).await;
 
-        // No-op if Tidy made no changes.
-        if formatted == text {
-            return Ok(None);
-        }
-
-        // Single whole-document replace edit.
-        let end = tree::byte_to_position(&text, text.len());
-        Ok(Some(vec![TextEdit {
-            range: Range {
-                start: Position::new(0, 0),
-                end,
-            },
-            new_text: formatted,
-        }]))
+        // Normalize line endings to LF before diffing, for two reasons:
+        //   1. Tidy emits CRLF on Windows. If Zed's buffer is LF, a raw diff
+        //      would flag every line as changed (\n vs \r\n) and degenerate to
+        //      a whole-document edit. Normalizing both sides yields a real,
+        //      minimal line diff.
+        //   2. Returning CRLF in formatting edits triggers a Zed cursor-jump
+        //      bug on Windows (zed#39547): Zed issues an extra didChange to
+        //      convert the text back to LF, miscalculates positions, and jumps
+        //      the cursor to EOF. Returning LF avoids it. Line-boundary
+        //      positions are identical for LF and CRLF, so the edit ranges
+        //      stay valid against Zed's buffer either way.
+        //
+        // Then emit minimal per-hunk edits covering only the changed lines —
+        // unchanged lines (including the cursor's) are left untouched. Empty
+        // vec (no Tidy changes) maps to None.
+        let text_lf = text.replace("\r\n", "\n");
+        let formatted_lf = formatted.replace("\r\n", "\n");
+        let edits = format_diff::diff_edits(&text_lf, &formatted_lf);
+        Ok((!edits.is_empty()).then_some(edits))
     }
 
     /// Sprint 2 — go-to-definition. Resolves the symbol under the cursor
