@@ -13,6 +13,7 @@ mod builtins;
 mod codeaction;
 mod complete;
 mod doccomment;
+mod highlight;
 mod hints;
 mod hover;
 mod includes;
@@ -470,6 +471,11 @@ impl LanguageServer for Backend {
                 // by the per-document FileIndex built in index.rs.
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                // v0.6.0 — document highlight: passive same-symbol highlighting
+                // within the current file (no cross-file resolution). Reuses the
+                // FileIndex find-refs + cursor-scope logic; marks assignment
+                // targets as Write, other occurrences as Read.
+                document_highlight_provider: Some(OneOf::Left(true)),
                 // Sprint 3 — completion. Trigger characters `$` and `@`
                 // fire the popup immediately when those sigils are typed;
                 // regular alpha input triggers via Zed's word-completion path.
@@ -1061,6 +1067,29 @@ impl LanguageServer for Backend {
             }
 
             Some(locations)
+        })();
+
+        Ok(result)
+    }
+
+    /// v0.6.0 — document highlight. Cursor-driven same-symbol highlighting
+    /// within the **current file only** (no `#include`/workspace resolution —
+    /// that's find-references' job). Returns one highlight per occurrence,
+    /// scope-filtered like find-references, with assignment targets marked
+    /// `Write` and other occurrences `Read`.
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let docs = self.inner.docs.read().await;
+        let result = (|| -> Option<Vec<DocumentHighlight>> {
+            let state = docs.get(&uri)?;
+            let tree = state.tree.as_ref()?;
+            let file_index = state.index.as_ref()?;
+            highlight::document_highlights(tree, &state.text, file_index, position)
         })();
 
         Ok(result)
