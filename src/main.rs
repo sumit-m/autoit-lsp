@@ -566,6 +566,14 @@ impl LanguageServer for Backend {
             );
         }
         self.check_and_publish(uri, text).await;
+        // Zed (and most LSP clients) don't fetch inlay hints on didOpen —
+        // hints only populate after the first edit by default. Sending a
+        // refresh notification here forces the client to request hints for
+        // the visible viewport immediately, so users see param-name ghost
+        // text as soon as the file opens rather than after their first
+        // keystroke. Errors (client doesn't support refresh, etc.) are
+        // harmless — silently drop them.
+        let _ = self.inner.client.inlay_hint_refresh().await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -672,6 +680,11 @@ impl LanguageServer for Backend {
         }
 
         self.check_and_publish(uri, text).await;
+        // Refresh inlay hints — UDF param names depend on the workspace
+        // index, which we just rebuilt on save. Without this, hints for
+        // newly-added UDF library calls wouldn't appear until the user
+        // types another character.
+        let _ = self.inner.client.inlay_hint_refresh().await;
     }
 
     /// Sprint 1 Day 2 — outline-panel response. Looks up the cached parse
