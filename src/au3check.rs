@@ -49,6 +49,10 @@ pub struct Au3CheckConfig<'a> {
     /// Process working directory. Set to the original file's dir as a
     /// fallback for any cwd-relative behaviour in Au3Check.
     pub cwd: Option<&'a Path>,
+    /// Extra raw arguments appended verbatim to the Au3Check argv,
+    /// tokenized from the `au3checkExtraArgs` user setting (e.g.
+    /// `["-w", "1", "-d"]`). Not validated — the user owns the contents.
+    pub extra_args: &'a [String],
 }
 
 /// Discover the Au3Check.exe path.
@@ -166,6 +170,11 @@ fn build_args(config: &Au3CheckConfig<'_>) -> Vec<std::ffi::OsString> {
     for dir in config.include_dirs {
         args.push("-I".into());
         args.push(dir.as_os_str().to_os_string());
+    }
+    // User-supplied extra flags (e.g. `-w 1 -d`), appended verbatim before
+    // the target file. Not validated — see the `au3checkExtraArgs` setting.
+    for arg in config.extra_args {
+        args.push(arg.into());
     }
     args.push(config.target.as_os_str().to_os_string());
     args
@@ -768,6 +777,7 @@ some other unrelated noise
             target: &target,
             include_dirs: &[],
             cwd: None,
+            extra_args: &[],
         };
         let args = build_args(&cfg);
         // -q, then target.
@@ -786,6 +796,7 @@ some other unrelated noise
             target: &target,
             include_dirs,
             cwd: None,
+            extra_args: &[],
         };
         let args = build_args(&cfg);
         // -q -I C:\proj -I C:\lib <target>
@@ -796,5 +807,25 @@ some other unrelated noise
         assert_eq!(args[3], "-I");
         assert_eq!(args[4], inc2.as_os_str());
         assert_eq!(args[5], target.as_os_str());
+    }
+
+    #[test]
+    fn build_args_appends_extra_args_before_target() {
+        let target = PathBuf::from(r"C:\tmp\x.au3");
+        let extra = vec!["-w".to_string(), "1".to_string(), "-d".to_string()];
+        let cfg = Au3CheckConfig {
+            target: &target,
+            include_dirs: &[],
+            cwd: None,
+            extra_args: &extra,
+        };
+        let args = build_args(&cfg);
+        // -q -w 1 -d <target>
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0], "-q");
+        assert_eq!(args[1], "-w");
+        assert_eq!(args[2], "1");
+        assert_eq!(args[3], "-d");
+        assert_eq!(args[4], target.as_os_str());
     }
 }

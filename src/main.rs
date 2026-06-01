@@ -69,6 +69,11 @@ struct InitializationOptions {
     /// Milliseconds to wait after the last keystroke before re-linting.
     /// Defaults to 400. Clamped to [50, 5000].
     debounce_ms: Option<u64>,
+    /// Extra raw arguments for Au3Check, typed as a single command-line
+    /// string (e.g. `"-w 1 -d"`). Tokenized (quote-aware) and appended
+    /// verbatim to the argv. Not validated — the user reads `Au3Check.exe
+    /// -h` and is responsible for the contents.
+    au3check_extra_args: Option<String>,
 }
 
 /// Resolved server-wide settings. Populated from
@@ -80,6 +85,9 @@ struct Settings {
     au3check_path: Option<PathBuf>,
     /// Validated debounce in ms. `None` means use `DEFAULT_DEBOUNCE_MS`.
     debounce_ms: Option<u64>,
+    /// Tokenized extra Au3Check args appended verbatim to the argv.
+    /// Empty = none. Not validated.
+    au3check_extra_args: Vec<String>,
 }
 
 /// In-memory state for one open document.
@@ -215,20 +223,37 @@ impl Backend {
             .unwrap_or(DEFAULT_DEBOUNCE_MS)
     }
 
+    /// Effective extra Au3Check args (already tokenized). Empty = none.
+    fn resolved_extra_args(&self) -> Vec<String> {
+        self.inner
+            .settings
+            .read()
+            .expect("lock not poisoned")
+            .au3check_extra_args
+            .clone()
+    }
+
     /// Parse a settings payload (from `initializationOptions` at startup
     /// or from `workspace/didChangeConfiguration` later) and update the
     /// server-wide settings. Tolerant of missing/wrong-shape input:
     /// parse errors are logged and leave settings untouched.
-    fn apply_settings(&self, value: serde_json::Value, source: &'static str) {
+    /// Returns `true` if an Au3Check-affecting setting (path or extra args)
+    /// changed, so the caller can re-lint open documents. `debounceMs` changes
+    /// don't affect lint *output*, so they don't count.
+    fn apply_settings(&self, value: serde_json::Value, source: &'static str) -> bool {
         let opts: InitializationOptions = match serde_json::from_value(value) {
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!(error = %e, source, "failed to parse settings — keeping current values");
-                return;
+                return false;
             }
         };
 
         let mut settings = self.inner.settings.write().expect("lock not poisoned");
+
+        // Snapshot the Au3Check-affecting settings to detect a real change.
+        let prev_au3check_path = settings.au3check_path.clone();
+        let prev_extra_args = settings.au3check_extra_args.clone();
 
         // Au3Check path with file-exists validation. Stale settings
         // (non-existent file) are cleared rather than retained, so
@@ -273,6 +298,53 @@ impl Backend {
             clamped
         });
 
+        // Extra Au3Check args: tokenized (quote-aware) and stored verbatim,
+        // with no validation. An absent / empty / whitespace-only setting
+        // clears it (falls back to the default argv).
+        settings.au3check_extra_args = opts
+            .au3check_extra_args
+            .as_deref()
+            .map(split_args)
+            .unwrap_or_default();
+        if settings.au3check_extra_args.is_empty() {
+            tracing::debug!(source, "au3checkExtraArgs empty — using default Au3Check argv");
+        } else {
+            tracing::info!(
+                args = ?settings.au3check_extra_args,
+                source,
+                "au3checkExtraArgs accepted (appended verbatim, unvalidated)"
+            );
+        }
+
+        settings.au3check_path != prev_au3check_path
+            || settings.au3check_extra_args != prev_extra_args
+    }
+
+    /// Re-lint every open document with the current settings. Called when an
+    /// Au3Check-affecting setting changes so the new flags take effect
+    /// immediately, without the user having to edit each file. Clears each
+    /// doc's content-hash cache first so `check_and_publish` doesn't skip the
+    /// re-check as a no-op (the text is unchanged — only the settings are).
+    async fn relint_all_open_docs(&self) {
+        let to_check: Vec<(Url, String)> = {
+            let mut docs = self.inner.docs.write().await;
+            docs.iter_mut()
+                .map(|(uri, state)| {
+                    state.last_checked_hash = None;
+                    (uri.clone(), state.text.clone())
+                })
+                .collect()
+        };
+        if to_check.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            count = to_check.len(),
+            "re-linting open docs after Au3Check settings change"
+        );
+        for (uri, text) in to_check {
+            self.check_and_publish(uri, text).await;
+        }
     }
 
     /// Stage the given buffer to a temp file, run Au3Check, and publish
@@ -314,10 +386,12 @@ impl Backend {
         // Build the Au3Check config. Vec<&Path> instead of an array
         // literal so lifetimes are obviously sound across the await.
         let include_dirs: Vec<&Path> = vec![original_dir.as_path()];
+        let extra_args = self.resolved_extra_args();
         let config = Au3CheckConfig {
             target: &temp_path,
             include_dirs: &include_dirs,
             cwd: Some(&original_dir),
+            extra_args: &extra_args,
         };
 
         match au3check::run_au3check(&au3check, config).await {
@@ -423,6 +497,40 @@ fn hash_text(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Tokenize a command-line-style argument string into individual argv
+/// elements. Whitespace-separated, but text inside `"double quotes"` is kept
+/// together (so `-I "C:\Program Files\x"` yields two tokens, with the quotes
+/// stripped). No escape handling beyond quotes — adequate for Au3Check flags;
+/// the user owns the contents. Used for the `au3checkExtraArgs` setting.
+fn split_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+    for ch in s.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                has_token = true; // a (possibly empty) quoted token exists
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if has_token {
+                    out.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        out.push(cur);
+    }
+    out
 }
 
 
@@ -1236,7 +1344,11 @@ impl LanguageServer for Backend {
             Some(nested) => nested.clone(),
             None => params.settings,
         };
-        self.apply_settings(value, "didChangeConfiguration");
+        if self.apply_settings(value, "didChangeConfiguration") {
+            // An Au3Check-affecting setting changed — re-lint open docs now so
+            // the new flags take effect without requiring an edit per file.
+            self.relint_all_open_docs().await;
+        }
     }
 }
 
@@ -1387,5 +1499,46 @@ mod tests {
         assert_eq!(hash_text("abc"), hash_text("abc"));
         assert_ne!(hash_text("abc"), hash_text("abcd"));
         assert_ne!(hash_text("abc"), hash_text(""));
+    }
+
+    // -- au3checkExtraArgs tokenization --
+
+    #[test]
+    fn split_args_basic_flags() {
+        assert_eq!(split_args("-w 1 -d"), vec!["-w", "1", "-d"]);
+    }
+
+    #[test]
+    fn split_args_collapses_extra_whitespace() {
+        assert_eq!(split_args("  -w   1  "), vec!["-w", "1"]);
+        assert_eq!(split_args("-w\t1"), vec!["-w", "1"]);
+    }
+
+    #[test]
+    fn split_args_empty_and_blank_yield_nothing() {
+        assert!(split_args("").is_empty());
+        assert!(split_args("   \t  ").is_empty());
+    }
+
+    #[test]
+    fn split_args_respects_double_quotes() {
+        // A quoted path with spaces stays one token, quotes stripped.
+        assert_eq!(
+            split_args(r#"-I "C:\Program Files\x" -d"#),
+            vec!["-I", r"C:\Program Files\x", "-d"]
+        );
+    }
+
+    #[test]
+    fn split_args_quote_adjacent_to_text() {
+        // Quotes can open/close mid-token.
+        assert_eq!(split_args(r#"-I"C:\a b"x"#), vec![r"-IC:\a bx"]);
+    }
+
+    #[test]
+    fn parse_init_options_with_extra_args() {
+        let v = serde_json::json!({ "au3checkExtraArgs": "-w 1 -d" });
+        let opts: InitializationOptions = serde_json::from_value(v).unwrap();
+        assert_eq!(opts.au3check_extra_args.as_deref(), Some("-w 1 -d"));
     }
 }
