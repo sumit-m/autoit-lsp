@@ -665,10 +665,36 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
-        // Parse and index before taking the docs write lock so we don't
-        // hold it across the (cheap, microsecond-scale) work.
+        // Parse and index synchronously (microsecond-scale, no lock held).
         let tree = tree::parse(&text);
         let file_index = tree.as_ref().map(|t| index::build_index(t, &text));
+
+        // Store the document with its parsed tree *immediately*, before the
+        // async #include resolution below. tower-lsp does not order a
+        // notification (didOpen) against the requests that follow it — they
+        // run concurrently — so an early textDocument/documentColor (or
+        // folding / documentSymbol) pull can race in while we're awaiting the
+        // workspace-index disk reads. If the document isn't in the map yet,
+        // those handlers return empty, and Zed caches the empty result until
+        // the next buffer change — which is exactly why color swatches didn't
+        // appear until the user's first edit. Inserting the tree now closes
+        // that window. `workspace_index` (needed only by cross-file features)
+        // is built next and patched in.
+        {
+            let mut docs = self.inner.docs.write().await;
+            docs.insert(
+                uri.clone(),
+                DocState {
+                    text: text.clone(),
+                    version: 0,
+                    first_edit_pending: true,
+                    last_checked_hash: None,
+                    tree: tree.clone(),
+                    index: file_index,
+                    workspace_index: None,
+                },
+            );
+        }
 
         // Sprint 4 — build the workspace index by resolving the #include tree.
         // Done outside the docs lock because it involves async disk reads.
@@ -679,21 +705,21 @@ impl LanguageServer for Backend {
             None
         };
 
-        {
+        // Patch the freshly-built workspace index into the stored document —
+        // but only if no edit or save has superseded the open (version still
+        // 0). did_change / did_save bump the version and own the index from
+        // that point, so skipping here avoids clobbering newer data with this
+        // open-time build. In that (vanishingly rare) lost-race case the
+        // cross-file index repopulates on the next save.
+        if let Some(ws) = workspace_index {
             let mut docs = self.inner.docs.write().await;
-            docs.insert(
-                uri.clone(),
-                DocState {
-                    text: text.clone(),
-                    version: 0,
-                    first_edit_pending: true,
-                    last_checked_hash: None,
-                    tree,
-                    index: file_index,
-                    workspace_index,
-                },
-            );
+            if let Some(state) = docs.get_mut(&uri) {
+                if state.version == 0 {
+                    state.workspace_index = Some(ws);
+                }
+            }
         }
+
         self.check_and_publish(uri, text).await;
         // Zed (and most LSP clients) don't fetch inlay hints on didOpen —
         // hints only populate after the first edit by default. Sending a
