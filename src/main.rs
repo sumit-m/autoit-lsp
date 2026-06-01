@@ -11,6 +11,7 @@
 mod au3check;
 mod builtins;
 mod codeaction;
+mod color;
 mod complete;
 mod doccomment;
 mod folding;
@@ -629,6 +630,12 @@ impl LanguageServer for Backend {
                     && self.inner.autoit3wrapper.is_some()
                     && self.inner.tidy_exe.is_some())
                 .then_some(OneOf::Left(true)),
+                // v0.6.0 — document color. Inline swatches on literal 0x… color
+                // arguments to known color functions, decoded per-function as
+                // RGB or BGR (see color.rs). Zed renders swatches today; the
+                // click-to-edit picker (colorPresentation) is dormant until Zed
+                // ships it (zed#52208) but answered correctly meanwhile.
+                color_provider: Some(ColorProviderCapability::Simple(true)),
                 ..Default::default()
             },
         })
@@ -1234,6 +1241,51 @@ impl LanguageServer for Backend {
         })();
 
         Ok(result)
+    }
+
+    /// v0.6.0 — document color. Returns an inline color swatch for every
+    /// literal `0x…` argument to a known color function, decoded per-function
+    /// as RGB (native GUI setters) or BGR (`_GUICtrl*` COLORREF wrappers).
+    /// Current-file only; no index needed.
+    async fn document_color(
+        &self,
+        params: DocumentColorParams,
+    ) -> Result<Vec<ColorInformation>> {
+        let uri = params.text_document.uri;
+
+        let docs = self.inner.docs.read().await;
+        let result = (|| -> Option<Vec<ColorInformation>> {
+            let state = docs.get(&uri)?;
+            let tree = state.tree.as_ref()?;
+            Some(color::document_colors(tree, &state.text))
+        })();
+
+        Ok(result.unwrap_or_default())
+    }
+
+    /// v0.6.0 — color presentation. Formats a picked color back into the
+    /// literal at the requested range, matching the enclosing function's
+    /// encoding. Dormant in Zed today (no color picker yet — zed#52208) but
+    /// kept correct so it works the moment Zed ships one.
+    async fn color_presentation(
+        &self,
+        params: ColorPresentationParams,
+    ) -> Result<Vec<ColorPresentation>> {
+        let uri = params.text_document.uri;
+
+        let docs = self.inner.docs.read().await;
+        let result = (|| -> Option<Vec<ColorPresentation>> {
+            let state = docs.get(&uri)?;
+            let tree = state.tree.as_ref()?;
+            Some(color::color_presentations(
+                tree,
+                &state.text,
+                params.color,
+                params.range,
+            ))
+        })();
+
+        Ok(result.unwrap_or_default())
     }
 
     /// Sprint 3 — completion. Determines context from the partial token at
