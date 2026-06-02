@@ -6,19 +6,31 @@ Companion to the [zed-autoit](https://github.com/sumit-m/zed-autoit) Zed editor 
 
 ## Status
 
-**v0.3.0 — diagnostics + outline + hover.** Layered on top of the v0.2.1 Au3Check diagnostics baseline:
-- An in-memory tree-sitter parse tree per open document (linked from the sibling `tree-sitter-autoit` crate), updated on every edit. Foundation for everything below.
-- `textDocument/documentSymbol` walks the tree to emit a hierarchical outline: functions with parameter children, top-level `Global`/`Const` declarations, `Global Enum` members, `#Region` blocks with their contents nested inside.
-- `textDocument/hover` looks up identifiers under the cursor in a static catalog of ~3,500 documented AutoIt functions (core builtins + UDF library functions) scraped from the official help, and renders a Markdown popup with signature, summary, parameters, return value, and a documentation link.
+**v0.6.0 — full-featured language server.** Built on an in-memory tree-sitter parse tree per open document (linked from the sibling `tree-sitter-autoit` crate), updated on every edit, plus a static catalog of ~3,500 documented AutoIt functions (core builtins + UDF library) scraped from the official help, a per-file symbol index, an `#include`-graph workspace index, and a project-wide index of every `.au3` under the workspace root.
 
-Au3Check diagnostics from v0.2.1 still work the same way — refresh on open, save, and after the user stops typing (configurable debounce, default 400ms; in-memory buffer is staged to a temp file so Au3Check can lint unsaved edits).
+LSP capabilities served:
 
-Still planned: completion (scope-aware), go-to-definition, find-references, cross-file `#include` resolution.
+- **Diagnostics** (`publishDiagnostics`) — wraps `Au3Check.exe`; refresh on open, save, and after the user stops typing (configurable debounce, default 400ms; the in-memory buffer is staged to a temp file so Au3Check can lint unsaved edits). Extra Au3Check flags via the `au3checkExtraArgs` setting.
+- **Hover** (`textDocument/hover`) — catalog popup for builtins/UDF-library functions; signature popup with doc-comments for user-defined functions.
+- **Document symbols** (`textDocument/documentSymbol`) — hierarchical outline.
+- **Go-to-definition / find-references** (`textDocument/definition`, `textDocument/references`) — within the file, across the `#include` graph, and project-wide (upward callers in files that include the current one).
+- **Completion** (`textDocument/completion`) — scope-aware: variables, macros, functions, cross-file symbols, and `#include` paths.
+- **Signature help** (`textDocument/signatureHelp`) and **inlay hints** (`textDocument/inlayHint`) — parameter names for builtins and UDFs.
+- **Code actions** (`textDocument/codeAction`) — add missing `#include`, fix function casing.
+- **Formatting** (`textDocument/formatting`) — via AutoIt3Wrapper's `/Tidy` mode.
+- **Document highlight** (`textDocument/documentHighlight`) — same-symbol read/write highlighting.
+- **Folding ranges** (`textDocument/foldingRange`) — functions, regions, control blocks, block comments.
+- **Document color** (`textDocument/documentColor` + `colorPresentation`) — swatches for `0x…` literals in color-taking GUI calls, per-function RGB/BGR decoding.
+- **Semantic tokens** (`textDocument/semanticTokens/full`) — UDF vs builtin, parameter/local/global/const/macro classification.
+- **Call hierarchy** (`textDocument/prepareCallHierarchy` + incoming/outgoing) — dual-index (`#include` graph + project-wide).
+- **`workspace/didChangeWatchedFiles`** — keeps the project index fresh as `.au3` files change on disk.
+
+Diagnostics, formatting, and task execution are Windows-only (they invoke AutoIt's Windows-only `.exe` binaries); every other capability is cross-platform.
 
 ## Requirements
 
-- Windows (Au3Check is a Windows-only executable).
-- AutoIt v3 installed.
+- The server builds and runs on Windows, Linux, and macOS.
+- Windows + AutoIt v3 installed is required for the diagnostics, formatting, and task features (they invoke AutoIt's Windows-only `.exe` binaries). All other features work on any platform.
 
 ## Au3Check discovery
 
