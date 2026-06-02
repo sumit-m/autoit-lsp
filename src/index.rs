@@ -3,9 +3,9 @@
 //! Sprint 2 infrastructure. Walks the tree-sitter parse tree once and
 //! builds two maps:
 //!   - `defs`:  lowercase name → all declaration sites (function defs,
-//!              variable/const/enum declarations, parameters).
+//!     variable/const/enum declarations, parameters).
 //!   - `refs`:  lowercase name → all usage sites (call expressions,
-//!              variable reads/writes, assignments).
+//!     variable reads/writes, assignments).
 //!
 //! Case-insensitive throughout: AutoIt is case-insensitive, so "Foo",
 //! "FOO", and "foo" all refer to the same symbol. Index keys are always
@@ -90,10 +90,10 @@ impl FileIndex {
         let defs = self.defs.get(&key)?;
 
         // Prefer a def scoped to the same function (params + locals).
-        if let Some(func) = cursor_scope {
-            if let Some(d) = defs.iter().find(|d| d.scope_func.as_deref() == Some(func)) {
-                return Some(d);
-            }
+        if let Some(func) = cursor_scope
+            && let Some(d) = defs.iter().find(|d| d.scope_func.as_deref() == Some(func))
+        {
+            return Some(d);
         }
 
         // Fall back to file-global.
@@ -209,18 +209,18 @@ fn collect(node: Node, source: &str, scope_func: Option<&str>, index: &mut FileI
         "call_expression" => {
             // Record the called identifier as a function reference, then
             // recurse into the argument list.
-            if let Some(fn_node) = node.child_by_field_name("function") {
-                if fn_node.kind() == "identifier" {
-                    let name = fn_node
-                        .utf8_text(source.as_bytes())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    if !name.is_empty() {
-                        index.refs.entry(name).or_default().push(SymbolRef {
-                            usage_range: node_range(&fn_node, source),
-                            scope_func: scope_func.map(String::from),
-                        });
-                    }
+            if let Some(fn_node) = node.child_by_field_name("function")
+                && fn_node.kind() == "identifier"
+            {
+                let name = fn_node
+                    .utf8_text(source.as_bytes())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if !name.is_empty() {
+                    index.refs.entry(name).or_default().push(SymbolRef {
+                        usage_range: node_range(&fn_node, source),
+                        scope_func: scope_func.map(String::from),
+                    });
                 }
             }
             // Recurse into everything except the `identifier` function-name
@@ -522,7 +522,7 @@ mod tests {
         let idx = index_for("Global $x = 1\n$x = $x + 1\n");
         // $x appears in the RHS ($x + 1) and as the LHS assignment target.
         let refs = idx.refs.get("$x").expect("$x in refs");
-        assert!(refs.len() >= 1, "at least one usage of $x");
+        assert!(!refs.is_empty(), "at least one usage of $x");
     }
 
     #[test]

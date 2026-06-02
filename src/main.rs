@@ -603,14 +603,11 @@ impl Backend {
         let new_hash = hash_text(&text);
         {
             let docs = self.inner.docs.read().await;
-            if let Some(state) = docs.get(&uri) {
-                if state.last_checked_hash == Some(new_hash) {
-                    tracing::debug!(
-                        uri = %uri,
-                        "skipping check — content hash matches last lint"
-                    );
-                    return;
-                }
+            if let Some(state) = docs.get(&uri)
+                && state.last_checked_hash == Some(new_hash)
+            {
+                tracing::debug!(uri = %uri, "skipping check — content hash matches last lint");
+                return;
             }
         }
 
@@ -1666,10 +1663,10 @@ impl LanguageServer for Backend {
                 }
             }
 
-            if include_decl {
-                if let Some(loc) = decl_location {
-                    locations.insert(0, loc);
-                }
+            if include_decl
+                && let Some(loc) = decl_location
+            {
+                locations.insert(0, loc);
             }
 
             // Dedupe — the current-file / `#include` / project layers overlap
@@ -1748,7 +1745,7 @@ impl LanguageServer for Backend {
             std::collections::HashSet::new();
         let mut open_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-        let mut add_site = |path: &Path,
+        let add_site = |path: &Path,
                             scope: Option<String>,
                             range: Range,
                             groups: &mut HashMap<(PathBuf, Option<String>), (PathBuf, Vec<Range>)>,
@@ -2030,14 +2027,11 @@ impl LanguageServer for Backend {
             // Sprint 4 — check for include-path completion context first.
             // Uses a line-based scan so it works even with partial/malformed
             // `#include` lines that tree-sitter has error-recovered.
-            if let Ok(path) = uri.to_file_path() {
-                if let Some(ctx) =
-                    includes::detect_include_context(&state.text, position, &path)
-                {
-                    let items =
-                        includes::include_path_completions(&ctx, autoit_include_dir.as_deref());
-                    return Some(CompletionResponse::Array(items));
-                }
+            if let Ok(path) = uri.to_file_path()
+                && let Some(ctx) = includes::detect_include_context(&state.text, position, &path)
+            {
+                let items = includes::include_path_completions(&ctx, autoit_include_dir.as_deref());
+                return Some(CompletionResponse::Array(items));
             }
 
             // Determine the partial token at the cursor. We walk back from
@@ -2151,10 +2145,10 @@ fn register_autoit_run() {
     };
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    if let Ok((key, _)) = hkcu.create_subkey(r"SOFTWARE\zed-autoit") {
-        if key.set_value("RunnerPath", &runner_str).is_ok() {
-            tracing::info!(path = %runner.display(), "registered autoit-run.exe in HKCU");
-        }
+    if let Ok((key, _)) = hkcu.create_subkey(r"SOFTWARE\zed-autoit")
+        && key.set_value("RunnerPath", &runner_str).is_ok()
+    {
+        tracing::info!(path = %runner.display(), "registered autoit-run.exe in HKCU");
     }
 }
 

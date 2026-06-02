@@ -32,6 +32,9 @@ pub struct FunctionDoc {
     /// Canonical (case-preserved) function name.
     pub name: String,
     /// `"core"` (functions.htm) or `"udf"` (libfunctions.htm).
+    /// Deserialized catalog metadata, retained as part of the data model
+    /// (not yet surfaced — e.g. for grouping functions in future UI).
+    #[allow(dead_code)]
     pub category: String,
     /// Direct URL of the detail page, for "see also" links in hover.
     pub url: String,
@@ -98,9 +101,13 @@ where
 /// Top-level shape of `data/builtins.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Catalog {
+    /// Provenance metadata from the scraper, deserialized and retained as part
+    /// of the data model (not currently read).
     #[serde(rename = "scrapedAt")]
+    #[allow(dead_code)]
     pub scraped_at: String,
     #[serde(rename = "sourceUrl")]
+    #[allow(dead_code)]
     pub source_url: String,
     /// Lowercase function name → docs. Keys are pre-lowercased by the
     /// scraper for cheap case-insensitive lookup.

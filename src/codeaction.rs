@@ -72,37 +72,35 @@ pub fn code_actions_for(
 
     // Path 1: client-supplied diagnostics.
     for diag in context_diagnostics {
-        if let Some(name) = identifier_at_range(source, &diag.range) {
-            if !name.is_empty() {
-                candidates.push((name.to_string(), diag.range, Some(diag.clone())));
-            }
+        if let Some(name) = identifier_at_range(source, &diag.range)
+            && !name.is_empty()
+        {
+            candidates.push((name.to_string(), diag.range, Some(diag.clone())));
         }
     }
 
     // Path 2: tree-based fallback when the client sent no diagnostics.
-    if candidates.is_empty() {
-        if let Some(t) = tree {
-            if let Some(node) = node_at_position(t, source, request_range.start) {
-                // Walk up to the nearest identifier or variable node.
-                let mut cur = node;
-                loop {
-                    if matches!(cur.kind(), "identifier" | "variable") {
-                        break;
-                    }
-                    match cur.parent() {
-                        Some(p) => cur = p,
-                        None => break,
-                    }
-                }
-                if matches!(cur.kind(), "identifier" | "variable") {
-                    if let Ok(name) = cur.utf8_text(source.as_bytes()) {
-                        if !name.is_empty() {
-                            let range = node_range(&cur, source);
-                            candidates.push((name.to_string(), range, None));
-                        }
-                    }
-                }
+    if candidates.is_empty()
+        && let Some(t) = tree
+        && let Some(node) = node_at_position(t, source, request_range.start)
+    {
+        // Walk up to the nearest identifier or variable node.
+        let mut cur = node;
+        loop {
+            if matches!(cur.kind(), "identifier" | "variable") {
+                break;
             }
+            match cur.parent() {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        if matches!(cur.kind(), "identifier" | "variable")
+            && let Ok(name) = cur.utf8_text(source.as_bytes())
+            && !name.is_empty()
+        {
+            let range = node_range(&cur, source);
+            candidates.push((name.to_string(), range, None));
         }
     }
 
@@ -122,35 +120,34 @@ pub fn code_actions_for(
             diag_opt.as_ref().map(|d| vec![d.clone()]);
 
         // ── Action 1: add missing #include ───────────────────────────────────
-        if let Some(include_str) = &doc.include {
-            if !already_has_include(source, include_str)
-                && offered_includes.insert(include_str.clone())
-            {
-                let insert_line = include_insertion_line(source);
-                let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-                changes.insert(
-                    uri.clone(),
-                    vec![TextEdit {
-                        range: Range {
-                            start: Position::new(insert_line, 0),
-                            end: Position::new(insert_line, 0),
-                        },
-                        new_text: format!("{include_str}\n"),
-                    }],
-                );
-                actions.push(CodeAction {
-                    title: format!("Add {include_str}"),
-                    kind: Some(CodeActionKind::QUICKFIX),
-                    diagnostics: diag_list.clone(),
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(changes),
-                        ..Default::default()
-                    }),
-                    // Mark as preferred so editors can apply it with one keystroke.
-                    is_preferred: Some(true),
+        if let Some(include_str) = &doc.include
+            && !already_has_include(source, include_str)
+            && offered_includes.insert(include_str.clone())
+        {
+            let insert_line = include_insertion_line(source);
+            let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+            changes.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: Range {
+                        start: Position::new(insert_line, 0),
+                        end: Position::new(insert_line, 0),
+                    },
+                    new_text: format!("{include_str}\n"),
+                }],
+            );
+            actions.push(CodeAction {
+                title: format!("Add {include_str}"),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: diag_list.clone(),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
                     ..Default::default()
-                });
-            }
+                }),
+                // Mark as preferred so editors can apply it with one keystroke.
+                is_preferred: Some(true),
+                ..Default::default()
+            });
         }
 
         // ── Action 2: fix function casing ────────────────────────────────────

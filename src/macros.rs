@@ -114,6 +114,10 @@ pub static MACROS: &[MacroDoc] = &[
 ];
 
 /// Case-insensitive lookup of a macro by name (with or without `@` prefix).
+///
+/// The macro-hover counterpart of [`crate::builtins::lookup`]; retained (and
+/// tested) for when hover surfaces macro docs — not yet wired into a handler.
+#[allow(dead_code)]
 pub fn lookup(name: &str) -> Option<&'static MacroDoc> {
     let normalised = if name.starts_with('@') {
         name.to_lowercase()

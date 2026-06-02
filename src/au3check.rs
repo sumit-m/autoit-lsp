@@ -89,10 +89,10 @@ fn install_dir_from_registry() -> Option<PathBuf> {
         r"SOFTWARE\WOW6432Node\AutoIt v3\AutoIt",
         r"SOFTWARE\AutoIt v3\AutoIt",
     ] {
-        if let Ok(key) = hklm.open_subkey(sub) {
-            if let Ok(dir) = key.get_value::<String, _>("InstallDir") {
-                return Some(PathBuf::from(dir));
-            }
+        if let Ok(key) = hklm.open_subkey(sub)
+            && let Ok(dir) = key.get_value::<String, _>("InstallDir")
+        {
+            return Some(PathBuf::from(dir));
         }
     }
     None
@@ -322,12 +322,12 @@ fn diagnostic_range(line: &str, col0: u32, msg: &str) -> (u32, u32) {
     // Case-insensitive: Au3Check normalises function names to their canonical
     // casing in messages (e.g. emits `FileOpen` even when source says
     // `fileopen`).  A case-sensitive find would miss the off-case spelling.
-    if let Some(id) = extract_leading_identifier(msg) {
-        if let Some(byte_start) = find_ascii_case_insensitive(line, id) {
-            let start = byte_start as u32;
-            let end = start + id.len() as u32;
-            return (start, end);
-        }
+    if let Some(id) = extract_leading_identifier(msg)
+        && let Some(byte_start) = find_ascii_case_insensitive(line, id)
+    {
+        let start = byte_start as u32;
+        let end = start + id.len() as u32;
+        return (start, end);
     }
 
     // Tier 4: single character at the reported column.

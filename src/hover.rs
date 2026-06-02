@@ -80,33 +80,31 @@ pub fn hover_for(
     }
 
     // 2. User-defined function in the current file.
-    if let Some(idx) = file_index {
-        if let Some(def) = idx.resolve_def(name, None) {
-            if def.kind == DefKind::Function {
-                return Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: format_udf_hover(def, None),
-                    }),
-                    range: Some(node_rng),
-                });
-            }
-        }
+    if let Some(idx) = file_index
+        && let Some(def) = idx.resolve_def(name, None)
+        && def.kind == DefKind::Function
+    {
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format_udf_hover(def, None),
+            }),
+            range: Some(node_rng),
+        });
     }
 
     // 3. User-defined function in an included file.
-    if let Some(ws) = workspace {
-        if let Some(entry) = ws.resolve_global(name) {
-            if entry.1.kind == DefKind::Function {
-                return Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: format_udf_hover(&entry.1, Some(&entry.0)),
-                    }),
-                    range: Some(node_rng),
-                });
-            }
-        }
+    if let Some(ws) = workspace
+        && let Some(entry) = ws.resolve_global(name)
+        && entry.1.kind == DefKind::Function
+    {
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format_udf_hover(&entry.1, Some(&entry.0)),
+            }),
+            range: Some(node_rng),
+        });
     }
 
     None
@@ -129,7 +127,7 @@ fn format_udf_hover(def: &SymbolDef, origin: Option<&Path>) -> String {
         None => {
             // Defensive fallback — should not occur for Function defs built
             // by collect_function_decl, but guards against future refactors.
-            let _ = write!(out, "Func {}(...)\n", def.display_name);
+            let _ = writeln!(out, "Func {}(...)", def.display_name);
         }
     }
     out.push_str("```\n");
@@ -174,12 +172,12 @@ fn format_markdown(doc: &FunctionDoc) -> String {
     }
     out.push_str("```\n");
 
-    if let Some(summary) = &doc.summary {
-        if !summary.is_empty() {
-            out.push('\n');
-            out.push_str(summary);
-            out.push('\n');
-        }
+    if let Some(summary) = &doc.summary
+        && !summary.is_empty()
+    {
+        out.push('\n');
+        out.push_str(summary);
+        out.push('\n');
     }
 
     if !doc.parameters.is_empty() {
@@ -197,22 +195,22 @@ fn format_markdown(doc: &FunctionDoc) -> String {
         }
     }
 
-    if let Some(rv) = &doc.return_value {
-        if !rv.is_empty() {
-            // **Returns:** on its own line so the body can be a markdown
-            // bullet list (which the scraper emits for structured
-            // success/failure tables) without the first bullet
-            // collapsing onto the same line as the label.
-            //
-            // Internal `\n`s in rv are already meaningful as bullet
-            // separators between rows — we don't transform them. (Rare
-            // per-row multi-line content stays as a soft break, which is
-            // acceptable for the supplementary nature of return-value
-            // detail rows.)
-            out.push_str("\n**Returns:**\n");
-            out.push_str(rv);
-            out.push('\n');
-        }
+    if let Some(rv) = &doc.return_value
+        && !rv.is_empty()
+    {
+        // **Returns:** on its own line so the body can be a markdown
+        // bullet list (which the scraper emits for structured
+        // success/failure tables) without the first bullet
+        // collapsing onto the same line as the label.
+        //
+        // Internal `\n`s in rv are already meaningful as bullet
+        // separators between rows — we don't transform them. (Rare
+        // per-row multi-line content stays as a soft break, which is
+        // acceptable for the supplementary nature of return-value
+        // detail rows.)
+        out.push_str("\n**Returns:**\n");
+        out.push_str(rv);
+        out.push('\n');
     }
 
     // Footer with the documentation link — handy for "I need the full page".

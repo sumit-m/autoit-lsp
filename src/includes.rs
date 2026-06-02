@@ -66,13 +66,13 @@ fn collect_includes(node: tree_sitter::Node, source: &str, out: &mut Vec<Include
                     let mut cursor = path_node.walk();
                     for child in path_node.children(&mut cursor) {
                         if child.kind() == "include_path_content" {
-                            if let Ok(raw) = child.utf8_text(source.as_bytes()) {
-                                if !raw.is_empty() {
-                                    out.push(IncludeDirective {
-                                        path: raw.to_string(),
-                                        form: IncludeForm::AngleBracket,
-                                    });
-                                }
+                            if let Ok(raw) = child.utf8_text(source.as_bytes())
+                                && !raw.is_empty()
+                            {
+                                out.push(IncludeDirective {
+                                    path: raw.to_string(),
+                                    form: IncludeForm::AngleBracket,
+                                });
                             }
                             break;
                         }
@@ -153,16 +153,6 @@ impl WorkspaceIndex {
             .filter(|(_, d)| d.kind == DefKind::Function)
     }
 
-    /// All globally-visible variable/constant/enum definitions across included files.
-    pub fn all_variables(&self) -> impl Iterator<Item = &(PathBuf, SymbolDef)> {
-        self.global_defs.values().flatten().filter(|(_, d)| {
-            matches!(
-                d.kind,
-                DefKind::Variable | DefKind::Constant | DefKind::EnumMember
-            )
-        })
-    }
-
     /// All reference sites for `name` across included files (case-insensitive).
     /// Returns an empty slice when the name has no recorded references.
     pub fn refs_for(&self, name: &str) -> &[(PathBuf, SymbolRef)] {
@@ -206,10 +196,10 @@ pub async fn build_workspace_index(
 
     // Seed the queue with the entry file's direct includes.
     for directive in extract_includes(entry_tree, entry_source) {
-        if let Some(resolved) = resolve_include(&directive, &entry_base, autoit_include_dir) {
-            if !visited.contains(&resolved) {
-                queue.push((resolved, 1));
-            }
+        if let Some(resolved) = resolve_include(&directive, &entry_base, autoit_include_dir)
+            && !visited.contains(&resolved)
+        {
+            queue.push((resolved, 1));
         }
     }
 
@@ -267,12 +257,10 @@ pub async fn build_workspace_index(
         // Enqueue this file's includes.
         if let Some(base) = path.parent() {
             for directive in extract_includes(&file_tree, &source) {
-                if let Some(resolved) =
-                    resolve_include(&directive, base, autoit_include_dir)
+                if let Some(resolved) = resolve_include(&directive, base, autoit_include_dir)
+                    && !visited.contains(&resolved)
                 {
-                    if !visited.contains(&resolved) {
-                        queue.push((resolved, depth + 1));
-                    }
+                    queue.push((resolved, depth + 1));
                 }
             }
         }
@@ -380,13 +368,11 @@ pub fn detect_include_context(
             partial: after_quote.to_string(),
             base_dir,
         })
-    } else if let Some(after_lt) = rest.strip_prefix('<') {
+    } else {
         // Angle-bracket form: everything between `<` and the cursor.
-        Some(IncludeContext::AngleBracket {
+        rest.strip_prefix('<').map(|after_lt| IncludeContext::AngleBracket {
             partial: after_lt.to_string(),
         })
-    } else {
-        None
     }
 }
 

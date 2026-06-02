@@ -152,23 +152,20 @@ fn lookup_param_names(
     }
 
     // 2. User-defined function in the current file.
-    if let Some(def) = file_index.and_then(|idx| idx.resolve_def(func_name, None)) {
-        if def.kind == DefKind::Function {
-            if let Some(sig) = &def.signature_line {
-                return parse_udf_params(sig);
-            }
-        }
+    if let Some(def) = file_index.and_then(|idx| idx.resolve_def(func_name, None))
+        && def.kind == DefKind::Function
+        && let Some(sig) = &def.signature_line
+    {
+        return parse_udf_params(sig);
     }
 
     // 3. User-defined function in an included file.
-    if let Some(ws) = workspace {
-        if let Some(entry) = ws.resolve_global(func_name) {
-            if entry.1.kind == DefKind::Function {
-                if let Some(sig) = &entry.1.signature_line {
-                    return parse_udf_params(sig);
-                }
-            }
-        }
+    if let Some(ws) = workspace
+        && let Some(entry) = ws.resolve_global(func_name)
+        && entry.1.kind == DefKind::Function
+        && let Some(sig) = &entry.1.signature_line
+    {
+        return parse_udf_params(sig);
     }
 
     vec![]

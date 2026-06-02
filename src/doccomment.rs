@@ -71,20 +71,15 @@ pub fn extract_doc_comment(source: &str, func_start_line: usize) -> Option<Strin
     // Walk backwards from the line immediately above the Func keyword,
     // collecting consecutive `;`-prefixed lines.
     let mut i = func_start_line - 1;
-    loop {
-        let raw = match all_lines.get(i) {
-            Some(l) => l,
-            None => break,
-        };
+    while let Some(raw) = all_lines.get(i) {
         let trimmed = raw.trim();
-        if trimmed.starts_with(';') {
-            comment_lines.push(raw);
-        } else {
+        if !trimmed.starts_with(';') {
             // Blank or non-comment line — stop. Even a single blank line
             // between a comment block and the Func keyword means the comment
             // is not associated with this function.
             break;
         }
+        comment_lines.push(raw);
         if i == 0 {
             break;
         }

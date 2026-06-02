@@ -54,10 +54,10 @@ fn install_dir_from_registry() -> Option<PathBuf> {
         r"SOFTWARE\WOW6432Node\AutoIt v3\AutoIt",
         r"SOFTWARE\AutoIt v3\AutoIt",
     ] {
-        if let Ok(key) = hklm.open_subkey(sub) {
-            if let Ok(dir) = key.get_value::<String, _>("InstallDir") {
-                return Some(PathBuf::from(dir));
-            }
+        if let Ok(key) = hklm.open_subkey(sub)
+            && let Ok(dir) = key.get_value::<String, _>("InstallDir")
+        {
+            return Some(PathBuf::from(dir));
         }
     }
     None
