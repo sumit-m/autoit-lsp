@@ -22,6 +22,7 @@ mod hover;
 mod includes;
 mod index;
 mod macros;
+mod project_index;
 mod signature;
 mod staging;
 mod symbols;
@@ -31,6 +32,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -53,6 +55,11 @@ const DEFAULT_DEBOUNCE_MS: u64 = 400;
 /// the LSP feel broken.
 const MIN_DEBOUNCE_MS: u64 = 50;
 const MAX_DEBOUNCE_MS: u64 = 5000;
+
+/// Debounce window for `workspace/didChangeWatchedFiles` bursts (e.g. a git
+/// checkout). The project index updates immediately on each notification; only
+/// the expensive open-doc rebuild + re-lint waits this long for things to settle.
+const WATCH_DEBOUNCE_MS: u64 = 300;
 
 /// LSP `initializationOptions` / `workspace/didChangeConfiguration`
 /// payload. Adding fields is additive — serde's default
@@ -174,6 +181,29 @@ struct Inner {
     /// hold reads across await (publishing diagnostics while a check
     /// is in flight).
     docs: AsyncRwLock<HashMap<Url, DocState>>,
+    /// v0.6.0 — workspace root folder from `initialize`'s `rootUri` /
+    /// `workspaceFolders`. `None` when Zed opened a bare single file (no
+    /// folder), which disables the project-wide index. `std::sync::RwLock`
+    /// because it's set once and read without holding across an await.
+    workspace_root: RwLock<Option<PathBuf>>,
+    /// v0.6.0 — project-wide symbol index spanning every `.au3` under
+    /// `workspace_root`. Built in the background on `initialized` and kept
+    /// fresh by `workspace/didChangeWatchedFiles`. Empty when there's no
+    /// workspace root. Backs call hierarchy and cross-file find-references
+    /// (the upward-caller direction the `#include` graph can't reach).
+    project_index: AsyncRwLock<project_index::ProjectIndex>,
+    /// v0.6.0 — whether the client advertised dynamic registration for
+    /// `workspace/didChangeWatchedFiles`. File watching in LSP is *only*
+    /// available via dynamic registration, so we register watchers in
+    /// `initialized` only when this is true. Set from the client capabilities
+    /// in `initialize`.
+    supports_dynamic_watchers: RwLock<bool>,
+    /// v0.6.0 — monotonic counter for debouncing watched-file bursts (e.g. a
+    /// git checkout touching many files). Each notification bumps it; the
+    /// expensive open-doc refresh runs only if no newer notification arrived
+    /// during the debounce window. The project index itself is updated
+    /// eagerly (cheap) — only the re-lint/refresh is debounced.
+    watch_generation: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +230,10 @@ impl Backend {
                 tidy_exe,
                 settings: RwLock::new(Settings::default()),
                 docs: AsyncRwLock::new(HashMap::new()),
+                workspace_root: RwLock::new(None),
+                project_index: AsyncRwLock::new(project_index::ProjectIndex::default()),
+                supports_dynamic_watchers: RwLock::new(false),
+                watch_generation: AtomicU64::new(0),
             }),
         }
     }
@@ -232,6 +266,203 @@ impl Backend {
             .expect("lock not poisoned")
             .au3check_extra_args
             .clone()
+    }
+
+    /// v0.6.0 — (re)build the project-wide index in the background.
+    ///
+    /// Reads the workspace root, then spawns a blocking task to walk the tree
+    /// and parse every `.au3` (CPU + filesystem bound — kept off the async
+    /// runtime). The freshly-built index replaces the stored one when done.
+    /// No-op when there's no workspace root (bare single-file session).
+    async fn spawn_project_scan(&self) {
+        let root = self
+            .inner
+            .workspace_root
+            .read()
+            .expect("lock not poisoned")
+            .clone();
+        let Some(root) = root else {
+            return;
+        };
+
+        let backend = self.clone();
+        tokio::spawn(async move {
+            let scanned = tokio::task::spawn_blocking(move || {
+                project_index::scan(&root, project_index::MAX_PROJECT_FILES)
+            })
+            .await;
+            match scanned {
+                Ok(index) => {
+                    let count = index.file_count();
+                    *backend.inner.project_index.write().await = index;
+                    tracing::info!(files = count, "project index ready");
+                }
+                Err(e) => tracing::warn!(error = %e, "project index scan task panicked"),
+            }
+        });
+    }
+
+    /// v0.6.0 — register `**/*.au3` + `**/*.a3x` file watchers via dynamic
+    /// capability registration, so the client notifies us of on-disk changes.
+    ///
+    /// The glob is workspace-relative; the client (Zed) backs it with native
+    /// OS watchers. No-op without a workspace root or when the client doesn't
+    /// support dynamic registration. We watch `.a3x` for completeness, but the
+    /// handler only re-indexes `.au3` (compiled `.a3x` is binary).
+    /// Angle-bracket `#include <…>` library files live in AutoIt's read-only
+    /// install dir, outside the workspace glob — intentionally not watched.
+    async fn register_file_watchers(&self) {
+        let has_root = self
+            .inner
+            .workspace_root
+            .read()
+            .expect("lock not poisoned")
+            .is_some();
+        let supported = *self
+            .inner
+            .supports_dynamic_watchers
+            .read()
+            .expect("lock not poisoned");
+        if !has_root || !supported {
+            tracing::info!(has_root, supported, "skipping file-watcher registration");
+            return;
+        }
+
+        let make_watcher = |glob: &str| FileSystemWatcher {
+            glob_pattern: GlobPattern::String(glob.to_string()),
+            kind: None, // None = Create | Change | Delete
+        };
+        let options = DidChangeWatchedFilesRegistrationOptions {
+            watchers: vec![make_watcher("**/*.au3"), make_watcher("**/*.a3x")],
+        };
+        let register_options = match serde_json::to_value(options) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not serialize watcher options");
+                return;
+            }
+        };
+        let registration = Registration {
+            id: "autoit-watched-files".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(register_options),
+        };
+
+        match self
+            .inner
+            .client
+            .register_capability(vec![registration])
+            .await
+        {
+            Ok(()) => tracing::info!("registered **/*.au3 + **/*.a3x file watchers"),
+            Err(e) => tracing::warn!(error = %e, "failed to register file watchers"),
+        }
+    }
+
+    /// v0.6.0 — apply a batch of watched-file changes to the project index,
+    /// then debounce-refresh open documents.
+    ///
+    /// Only `.au3` changes matter to the symbol index. Reads happen before the
+    /// lock (async I/O) so the write lock is held only for the cheap apply.
+    async fn handle_watched_changes(&self, changes: Vec<FileEvent>) {
+        // Read sources for create/change up front (no lock held across I/O).
+        enum Apply {
+            Upsert(PathBuf, String),
+            Remove(PathBuf),
+        }
+        let mut applies: Vec<Apply> = Vec::new();
+        for change in changes {
+            let Ok(path) = change.uri.to_file_path() else {
+                continue;
+            };
+            if !project_index::is_au3(&path) {
+                continue; // .a3x is binary; nothing to index
+            }
+            match change.typ {
+                FileChangeType::CREATED | FileChangeType::CHANGED => {
+                    match tokio::fs::read_to_string(&path).await {
+                        Ok(src) => applies.push(Apply::Upsert(path, src)),
+                        // Unreadable (e.g. deleted between event and read) —
+                        // drop any stale entry so we don't keep ghost data.
+                        Err(_) => applies.push(Apply::Remove(path)),
+                    }
+                }
+                FileChangeType::DELETED => applies.push(Apply::Remove(path)),
+                _ => {}
+            }
+        }
+
+        if applies.is_empty() {
+            return; // nothing relevant (e.g. only .a3x changes)
+        }
+
+        {
+            let mut pi = self.inner.project_index.write().await;
+            for apply in &applies {
+                match apply {
+                    Apply::Upsert(path, src) => pi.upsert(path, src),
+                    Apply::Remove(path) => {
+                        pi.remove(path);
+                    }
+                }
+            }
+        }
+
+        // Debounce the expensive open-doc refresh: coalesce bursts (e.g. a git
+        // checkout) so we rebuild include graphs + re-lint only once things
+        // settle. The project index above is already up to date regardless.
+        let generation = self.inner.watch_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let backend = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(WATCH_DEBOUNCE_MS)).await;
+            if backend.inner.watch_generation.load(Ordering::SeqCst) == generation {
+                backend.refresh_open_docs_after_watch().await;
+            }
+        });
+    }
+
+    /// v0.6.0 — rebuild every open document's `#include` workspace index from
+    /// disk (the changed file may be in its include graph), re-lint, and ask
+    /// the client to re-pull inlay hints (cross-file parameter names may have
+    /// changed). Runs after the watched-file debounce settles.
+    async fn refresh_open_docs_after_watch(&self) {
+        // Snapshot open docs (uri + text + cloned tree) without holding the
+        // lock across the async index rebuilds below.
+        let snapshot: Vec<(Url, String, tree_sitter::Tree)> = {
+            let docs = self.inner.docs.read().await;
+            docs.iter()
+                .filter_map(|(uri, state)| {
+                    state
+                        .tree
+                        .as_ref()
+                        .map(|t| (uri.clone(), state.text.clone(), t.clone()))
+                })
+                .collect()
+        };
+        if snapshot.is_empty() {
+            return;
+        }
+
+        let include_dir = self.inner.autoit_include_dir.clone();
+        for (uri, text, tree) in snapshot {
+            let Ok(path) = uri.to_file_path() else {
+                continue;
+            };
+            let ws =
+                includes::build_workspace_index(&path, &tree, &text, include_dir.as_deref()).await;
+            {
+                let mut docs = self.inner.docs.write().await;
+                if let Some(state) = docs.get_mut(&uri) {
+                    state.workspace_index = Some(ws);
+                }
+            }
+            self.check_and_publish(uri, text).await;
+        }
+
+        // Re-pulled inlay hints pick up cross-file param-name changes. (No
+        // documentColor refresh exists, and colors are current-file only, so
+        // an external include change can't affect them.)
+        let _ = self.inner.client.inlay_hint_refresh().await;
     }
 
     /// Parse a settings payload (from `initializationOptions` at startup
@@ -550,6 +781,45 @@ impl LanguageServer for Backend {
             self.apply_settings(value, "initializationOptions");
         }
 
+        // v0.6.0 — capture the workspace root for the project-wide index.
+        // Prefer the first workspaceFolder; fall back to the (deprecated)
+        // rootUri. `None` (bare single-file session) leaves the project index
+        // empty — cross-file features degrade to include-graph scope.
+        let root = params
+            .workspace_folders
+            .as_ref()
+            .and_then(|folders| folders.first())
+            .map(|f| f.uri.clone())
+            .or(params.root_uri)
+            .and_then(|uri| uri.to_file_path().ok());
+        if let Some(ref path) = root {
+            tracing::info!(root = %path.display(), "workspace root detected");
+        } else {
+            tracing::info!("no workspace root (single-file session) — project index disabled");
+        }
+        *self.inner.workspace_root.write().expect("lock not poisoned") = root;
+
+        // v0.6.0 — file watching in LSP is available only via dynamic
+        // registration, gated on the client advertising it. Record support so
+        // `initialized` knows whether to register watchers. (This is the
+        // "verify Zed support" checkpoint — the log line confirms it at runtime.)
+        let supports_watchers = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.did_change_watched_files.as_ref())
+            .and_then(|d| d.dynamic_registration)
+            .unwrap_or(false);
+        tracing::info!(
+            supports_watchers,
+            "client didChangeWatchedFiles dynamic-registration support"
+        );
+        *self
+            .inner
+            .supports_dynamic_watchers
+            .write()
+            .expect("lock not poisoned") = supports_watchers;
+
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "autoit-lsp".into(),
@@ -652,6 +922,16 @@ impl LanguageServer for Backend {
                  initializationOptions.au3checkPath — diagnostics disabled"
             ),
         }
+
+        // v0.6.0 — build the project-wide index in the background. The scan is
+        // filesystem-bound (recursive walk + parse), so it runs on a blocking
+        // thread and the result is stored once ready; no handler blocks on it.
+        self.spawn_project_scan().await;
+
+        // v0.6.0 — register file watchers so the project index and open-doc
+        // include graphs stay fresh when `.au3` files change on disk outside
+        // Zed. Only when the client supports dynamic registration.
+        self.register_file_watchers().await;
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -713,10 +993,10 @@ impl LanguageServer for Backend {
         // cross-file index repopulates on the next save.
         if let Some(ws) = workspace_index {
             let mut docs = self.inner.docs.write().await;
-            if let Some(state) = docs.get_mut(&uri) {
-                if state.version == 0 {
-                    state.workspace_index = Some(ws);
-                }
+            if let Some(state) = docs.get_mut(&uri)
+                && state.version == 0
+            {
+                state.workspace_index = Some(ws);
             }
         }
 
@@ -729,6 +1009,16 @@ impl LanguageServer for Backend {
         // keystroke. Errors (client doesn't support refresh, etc.) are
         // harmless — silently drop them.
         let _ = self.inner.client.inlay_hint_refresh().await;
+    }
+
+    /// v0.6.0 — `workspace/didChangeWatchedFiles`. Fired by the client when a
+    /// watched `.au3` is created/changed/deleted on disk (including outside
+    /// Zed — git checkout, external editor, generated files). Updates the
+    /// project-wide index immediately, then debounce-refreshes open documents'
+    /// `#include` graphs and diagnostics.
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        tracing::debug!(count = params.changes.len(), "didChangeWatchedFiles");
+        self.handle_watched_changes(params.changes).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -1141,6 +1431,9 @@ impl LanguageServer for Backend {
         let include_decl = params.context.include_declaration;
 
         let docs = self.inner.docs.read().await;
+        // v0.6.0 — the project-wide index supplies upward callers (files that
+        // include the current one) that the downward `#include` graph can't see.
+        let project_index = self.inner.project_index.read().await;
         let result = (|| -> Option<Vec<Location>> {
             let state = docs.get(&uri)?;
             let tree = state.tree.as_ref()?;
@@ -1198,12 +1491,41 @@ impl LanguageServer for Backend {
                 .collect();
 
             // Cross-file refs — only meaningful for global symbols (no scope).
-            // The workspace index stores ref sites from all included files;
-            // the entry file itself is excluded from the workspace so there
-            // is no overlap with the current-file refs above.
+            // Two layers (the locked dual-index model):
             if def_scope.is_none() {
+                // (a) Downward `#include` graph — the semantic authority. Reaches
+                //     files the current document includes (even outside the
+                //     workspace root). Excludes the entry file itself, so no
+                //     overlap with the current-file refs above.
                 if let Some(ws) = state.workspace_index.as_ref() {
                     for (path, r) in ws.refs_for(name) {
+                        if let Ok(ref_uri) = Url::from_file_path(path) {
+                            locations.push(Location {
+                                uri: ref_uri,
+                                range: r.usage_range,
+                            });
+                        }
+                    }
+                }
+
+                // (b) Project-wide index — completeness for *upward* callers
+                //     (files that include the current one), which the downward
+                //     graph can't reach. #include-precedence guard: only safe
+                //     when the name is unambiguous project-wide (≤1 definition).
+                //     On a collision (≥2 same-named defs in unrelated files) we
+                //     can't tell which definition a given project ref points to
+                //     without resolving each ref-file's own include graph, so we
+                //     conservatively skip this layer — no false positives, at the
+                //     cost of completeness in that rare case.
+                if project_index.defs_for(name).len() <= 1 {
+                    // The current file's refs come authoritatively from
+                    // `file_index` (the live buffer); the project index only
+                    // has its possibly-stale on-disk copy, so skip it here.
+                    let current = uri.to_file_path().ok().map(|p| project_index::norm(&p));
+                    for (path, r) in project_index.refs_for(name) {
+                        if current.as_ref() == Some(&project_index::norm(path)) {
+                            continue;
+                        }
                         if let Ok(ref_uri) = Url::from_file_path(path) {
                             locations.push(Location {
                                 uri: ref_uri,
@@ -1219,6 +1541,21 @@ impl LanguageServer for Backend {
                     locations.insert(0, loc);
                 }
             }
+
+            // Dedupe — the current-file / `#include` / project layers overlap
+            // (the project index also covers the current file and any included
+            // files under the root). Keep first occurrence to preserve the
+            // declaration's leading position when `include_decl` is set.
+            let mut seen = std::collections::HashSet::new();
+            locations.retain(|l| {
+                seen.insert((
+                    l.uri.as_str().to_string(),
+                    l.range.start.line,
+                    l.range.start.character,
+                    l.range.end.line,
+                    l.range.end.character,
+                ))
+            });
 
             Some(locations)
         })();
