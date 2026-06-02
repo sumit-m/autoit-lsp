@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::index::{build_index, SymbolDef, SymbolRef};
+use crate::index::{build_index, DefKind, SymbolDef, SymbolRef};
 use crate::tree;
 
 /// Upper bound on `.au3` files indexed project-wide. A safety ceiling for
@@ -116,6 +116,26 @@ impl ProjectIndex {
             }
         }
         out
+    }
+
+    /// All project files that define `name` as a **function** (case-insensitive).
+    /// Used by call hierarchy to resolve a call target project-wide.
+    pub fn function_defs_for(&self, name: &str) -> Vec<(&Path, &SymbolDef)> {
+        self.defs_for(name)
+            .into_iter()
+            .filter(|(_, d)| d.kind == DefKind::Function)
+            .collect()
+    }
+
+    /// The file-global definition of `name` within a specific file
+    /// (case-insensitive), if that file is indexed. Used by call hierarchy to
+    /// build the caller-function item for an incoming call.
+    pub fn def_in_file(&self, path: &Path, name: &str) -> Option<&SymbolDef> {
+        self.files
+            .get(&norm(path))?
+            .defs
+            .get(&name.to_lowercase())?
+            .first()
     }
 
     /// Number of files currently indexed.

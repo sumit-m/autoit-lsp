@@ -10,6 +10,7 @@
 
 mod au3check;
 mod builtins;
+mod callhierarchy;
 mod codeaction;
 mod color;
 mod complete;
@@ -765,6 +766,111 @@ fn split_args(s: &str) -> Vec<String> {
     out
 }
 
+// ─── Call hierarchy helpers (v0.6.0) ────────────────────────────────────────
+
+/// Build a [`CallHierarchyItem`] for a resolved function definition.
+fn call_item(uri: Url, def: &index::SymbolDef) -> CallHierarchyItem {
+    CallHierarchyItem {
+        name: def.display_name.clone(),
+        kind: SymbolKind::FUNCTION,
+        tags: None,
+        detail: def.signature_line.clone(),
+        uri,
+        range: def.full_range,
+        selection_range: def.name_range,
+        data: None,
+    }
+}
+
+/// Resolve a function name to its canonical definition (`#include` precedence):
+/// the file's own index → `#include` graph → project-wide index. Returns the
+/// def's URI and a clone of its [`SymbolDef`]. Non-functions / builtins (no
+/// def) yield `None`.
+///
+/// Takes the index pieces directly (rather than a `DocState`) so callers can
+/// pass a freshly-built index for an on-disk file that isn't open.
+fn resolve_func_def(
+    name: &str,
+    file_index: Option<&index::FileIndex>,
+    workspace_index: Option<&includes::WorkspaceIndex>,
+    file_uri: &Url,
+    project_index: &project_index::ProjectIndex,
+) -> Option<(Url, index::SymbolDef)> {
+    // 1. The file's own index (live for an open doc).
+    if let Some(fi) = file_index
+        && let Some(def) = fi.resolve_def(name, None)
+        && def.kind == index::DefKind::Function
+    {
+        return Some((file_uri.clone(), def.clone()));
+    }
+    // 2. Downward #include graph — the semantic authority.
+    if let Some(ws) = workspace_index
+        && let Some((path, def)) = ws.resolve_global(name)
+        && def.kind == index::DefKind::Function
+        && let Ok(uri) = Url::from_file_path(path)
+    {
+        return Some((uri, def.clone()));
+    }
+    // 3. Project-wide (completeness). On a collision we take the first match —
+    //    prepare just needs a definition to anchor the tree; incoming/outgoing
+    //    apply their own collision guards.
+    if let Some((path, def)) = project_index.function_defs_for(name).into_iter().next()
+        && let Ok(uri) = Url::from_file_path(path)
+    {
+        return Some((uri, def.clone()));
+    }
+    None
+}
+
+/// Build the `from` item for an incoming call: the calling function (or the
+/// script file itself for a top-level call). `scope` is the caller's enclosing
+/// function (lowercase), or `None` for a file-global call site.
+fn build_caller_item(
+    orig_path: &Path,
+    scope: &Option<String>,
+    project_index: &project_index::ProjectIndex,
+    fallback_range: Range,
+) -> Option<CallHierarchyItem> {
+    let uri = Url::from_file_path(orig_path).ok()?;
+    match scope {
+        Some(caller) => {
+            if let Some(def) = project_index.def_in_file(orig_path, caller) {
+                Some(call_item(uri, def))
+            } else {
+                // Caller's def not indexed (file outside the project root, or an
+                // unsaved open buffer) — synthesize a minimal navigable item.
+                Some(CallHierarchyItem {
+                    name: caller.clone(),
+                    kind: SymbolKind::FUNCTION,
+                    tags: None,
+                    detail: None,
+                    uri,
+                    range: fallback_range,
+                    selection_range: fallback_range,
+                    data: None,
+                })
+            }
+        }
+        None => {
+            // Top-level call (outside any function) — represent the script file.
+            let stem = orig_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "<script>".to_string());
+            let zero = Range::new(Position::new(0, 0), Position::new(0, 0));
+            Some(CallHierarchyItem {
+                name: stem,
+                kind: SymbolKind::MODULE,
+                tags: None,
+                detail: None,
+                uri,
+                range: zero,
+                selection_range: zero,
+                data: None,
+            })
+        }
+    }
+}
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
@@ -906,6 +1012,12 @@ impl LanguageServer for Backend {
                 // click-to-edit picker (colorPresentation) is dormant until Zed
                 // ships it (zed#52208) but answered correctly meanwhile.
                 color_provider: Some(ColorProviderCapability::Simple(true)),
+                // v0.6.0 — call hierarchy. prepare resolves the function at the
+                // cursor to its canonical definition; incoming/outgoing use the
+                // dual-index model (project-wide index for upward callers, the
+                // #include graph as the semantic authority). Surfaced via Zed's
+                // command palette.
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 ..Default::default()
             },
         })
@@ -1561,6 +1673,194 @@ impl LanguageServer for Backend {
         })();
 
         Ok(result)
+    }
+
+    /// v0.6.0 — call hierarchy: prepare. Resolves the function under the cursor
+    /// (definition or call site) to its canonical definition (`#include`
+    /// precedence) and returns it as the anchor item for incoming/outgoing.
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> Result<Option<Vec<CallHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let docs = self.inner.docs.read().await;
+        let project_index = self.inner.project_index.read().await;
+        let result = (|| -> Option<Vec<CallHierarchyItem>> {
+            let state = docs.get(&uri)?;
+            let tree = state.tree.as_ref()?;
+            let (name, _) = callhierarchy::function_ident_at(tree, &state.text, position)?;
+            let (def_uri, def) = resolve_func_def(
+                &name,
+                state.index.as_ref(),
+                state.workspace_index.as_ref(),
+                &uri,
+                &project_index,
+            )?;
+            Some(vec![call_item(def_uri, &def)])
+        })();
+
+        Ok(result)
+    }
+
+    /// v0.6.0 — call hierarchy: incoming calls (who calls this function).
+    ///
+    /// Dual-index: live open documents supply fresh call sites; the project-wide
+    /// index supplies the rest (notably *upward* callers in files that include
+    /// the target). #include-precedence collision guard: when the name has ≥2
+    /// function defs project-wide we can't attribute a project call site to THIS
+    /// definition without resolving each caller's own include graph, so we use
+    /// only open-document callers — no false positives, reduced completeness.
+    /// Call sites are grouped by their enclosing function (the `from` item).
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        let name = params.item.name;
+
+        let docs = self.inner.docs.read().await;
+        let project_index = self.inner.project_index.read().await;
+        let use_project = project_index.function_defs_for(&name).len() <= 1;
+
+        // (norm_path, caller_scope) → (original_path, call ranges). A seen-set
+        // dedupes sites that appear in both a live open doc and the project index.
+        let mut groups: HashMap<(PathBuf, Option<String>), (PathBuf, Vec<Range>)> = HashMap::new();
+        let mut seen: std::collections::HashSet<(PathBuf, u32, u32, u32, u32)> =
+            std::collections::HashSet::new();
+        let mut open_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+        let mut add_site = |path: &Path,
+                            scope: Option<String>,
+                            range: Range,
+                            groups: &mut HashMap<(PathBuf, Option<String>), (PathBuf, Vec<Range>)>,
+                            seen: &mut std::collections::HashSet<(PathBuf, u32, u32, u32, u32)>| {
+            let np = project_index::norm(path);
+            let sk = (
+                np.clone(),
+                range.start.line,
+                range.start.character,
+                range.end.line,
+                range.end.character,
+            );
+            if seen.insert(sk) {
+                groups
+                    .entry((np, scope))
+                    .or_insert_with(|| (path.to_path_buf(), Vec::new()))
+                    .1
+                    .push(range);
+            }
+        };
+
+        // Live open-document call sites (authoritative for open files).
+        for (doc_uri, state) in docs.iter() {
+            let Ok(path) = doc_uri.to_file_path() else {
+                continue;
+            };
+            open_paths.insert(project_index::norm(&path));
+            if let Some(fi) = state.index.as_ref() {
+                for r in fi.find_refs(&name, None) {
+                    add_site(&path, r.scope_func.clone(), r.usage_range, &mut groups, &mut seen);
+                }
+            }
+        }
+
+        // Project-wide call sites (skip files already covered live above).
+        if use_project {
+            for (path, r) in project_index.refs_for(&name) {
+                if open_paths.contains(&project_index::norm(path)) {
+                    continue;
+                }
+                add_site(path, r.scope_func.clone(), r.usage_range, &mut groups, &mut seen);
+            }
+        }
+
+        let mut result = Vec::new();
+        for ((_, scope), (orig_path, ranges)) in groups {
+            let fallback = ranges.first().copied().unwrap_or_default();
+            if let Some(from) = build_caller_item(&orig_path, &scope, &project_index, fallback) {
+                result.push(CallHierarchyIncomingCall {
+                    from,
+                    from_ranges: ranges,
+                });
+            }
+        }
+
+        Ok(Some(result))
+    }
+
+    /// v0.6.0 — call hierarchy: outgoing calls (what this function calls).
+    ///
+    /// Walks the target function's body (live tree if the file is open, else
+    /// read+parsed from disk) and resolves each callee to its definition with
+    /// the same `#include`-precedence rule. Builtins / unresolved names are
+    /// skipped (no definition to navigate to). Grouped per callee.
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let name = params.item.name;
+        let target_uri = params.item.uri;
+
+        let docs = self.inner.docs.read().await;
+        let project_index = self.inner.project_index.read().await;
+
+        // Obtain the target function's source + tree and a resolution context.
+        // Open doc → live state; otherwise read the file from disk and build a
+        // throwaway index (no #include graph in that case — project index covers
+        // cross-file callees).
+        let built_index;
+        let (source, tree, file_index_opt, ws_opt): (
+            String,
+            tree_sitter::Tree,
+            Option<&index::FileIndex>,
+            Option<&includes::WorkspaceIndex>,
+        ) = if let Some(state) = docs.get(&target_uri) {
+            let Some(t) = state.tree.as_ref() else {
+                return Ok(None);
+            };
+            (
+                state.text.clone(),
+                t.clone(),
+                state.index.as_ref(),
+                state.workspace_index.as_ref(),
+            )
+        } else {
+            let Ok(path) = target_uri.to_file_path() else {
+                return Ok(None);
+            };
+            let Ok(src) = tokio::fs::read_to_string(&path).await else {
+                return Ok(None);
+            };
+            let Some(t) = tree::parse(&src) else {
+                return Ok(None);
+            };
+            built_index = index::build_index(&t, &src);
+            (src, t, Some(&built_index), None)
+        };
+
+        let calls = callhierarchy::calls_in_function(&tree, &source, &name);
+
+        // Group by callee (case-insensitive); one `to` item, many call ranges.
+        let mut groups: HashMap<String, (CallHierarchyItem, Vec<Range>)> = HashMap::new();
+        for (callee, range) in calls {
+            let key = callee.to_lowercase();
+            if let Some(entry) = groups.get_mut(&key) {
+                entry.1.push(range);
+            } else if let Some((uri, def)) =
+                resolve_func_def(&callee, file_index_opt, ws_opt, &target_uri, &project_index)
+            {
+                groups.insert(key, (call_item(uri, &def), vec![range]));
+            }
+            // Unresolved (builtin or unknown) → no navigable target; skip.
+        }
+
+        let result: Vec<CallHierarchyOutgoingCall> = groups
+            .into_values()
+            .map(|(to, from_ranges)| CallHierarchyOutgoingCall { to, from_ranges })
+            .collect();
+
+        Ok(Some(result))
     }
 
     /// v0.6.0 — document highlight. Cursor-driven same-symbol highlighting
