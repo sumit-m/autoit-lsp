@@ -24,6 +24,7 @@ mod includes;
 mod index;
 mod macros;
 mod project_index;
+mod semtokens;
 mod signature;
 mod staging;
 mod symbols;
@@ -464,6 +465,11 @@ impl Backend {
         // documentColor refresh exists, and colors are current-file only, so
         // an external include change can't affect them.)
         let _ = self.inner.client.inlay_hint_refresh().await;
+        // Semantic-token classifications (UDF vs builtin, cross-file constants)
+        // can change when an included file is edited externally. Whether Zed
+        // honors this refresh is unverified — harmless if not (colors just stay
+        // until the next edit). Errors are dropped.
+        let _ = self.inner.client.semantic_tokens_refresh().await;
     }
 
     /// Parse a settings payload (from `initializationOptions` at startup
@@ -1018,6 +1024,18 @@ impl LanguageServer for Backend {
                 // #include graph as the semantic authority). Surfaced via Zed's
                 // command palette.
                 call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
+                // v0.6.0 — semantic tokens (full only; no range — Zed doesn't
+                // implement it — and no delta). The legend distinguishes UDF vs
+                // builtin functions, param/local/global variables, constants,
+                // and macros. Computed on demand per pull request.
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                        work_done_progress_options: Default::default(),
+                        legend: semtokens::legend(),
+                        range: Some(false),
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                    }),
+                ),
                 ..Default::default()
             },
         })
@@ -1861,6 +1879,37 @@ impl LanguageServer for Backend {
             .collect();
 
         Ok(Some(result))
+    }
+
+    /// v0.6.0 — semantic tokens (full document). Walks the parse tree and
+    /// classifies each identifier/variable/macro using the symbol indexes:
+    /// UDF vs builtin functions, parameter/local/global variables, constants,
+    /// macros, and definitions vs calls. Variables resolve current-file only;
+    /// functions/constants use the workspace index too. Computed on demand.
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+
+        let docs = self.inner.docs.read().await;
+        let result = (|| -> Option<SemanticTokensResult> {
+            let state = docs.get(&uri)?;
+            let tree = state.tree.as_ref()?;
+            let file_index = state.index.as_ref()?;
+            let data = semtokens::semantic_tokens(
+                tree,
+                &state.text,
+                file_index,
+                state.workspace_index.as_ref(),
+            );
+            Some(SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data,
+            }))
+        })();
+
+        Ok(result)
     }
 
     /// v0.6.0 — document highlight. Cursor-driven same-symbol highlighting
