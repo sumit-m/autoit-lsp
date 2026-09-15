@@ -179,11 +179,13 @@ fn enum_symbols(node: Node, source: &str) -> Vec<DocumentSymbol> {
 /// so a region inside a region inside a region all collapse correctly.
 fn region_symbol(node: Node, source: &str) -> Option<DocumentSymbol> {
     // `name` field is `directive_args`; raw bytes include any whitespace
-    // between `#Region` and the end of line. Trim for display.
+    // between `#Region` and the end of line. Labels are often written as a
+    // comment (`#Region ; Includes`, AutoIt3Wrapper's `#Region ;**** ... ****`),
+    // so drop the comment marker along with the whitespace.
     let name = node
         .child_by_field_name("name")
         .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim().trim_start_matches(';').trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "(region)".into());
 
@@ -318,6 +320,23 @@ mod tests {
         assert_eq!(kids[0].kind, SymbolKind::VARIABLE);
         assert_eq!(kids[1].name, "$B");
         assert_eq!(kids[1].kind, SymbolKind::CONSTANT);
+    }
+
+    #[test]
+    fn region_comment_style_label_drops_marker() {
+        let syms = symbols_for("#Region ; browse catalog\nGlobal $a = 1\n#EndRegion\n");
+        assert_eq!(syms[0].name, "browse catalog");
+
+        let syms = symbols_for(
+            "#Region ;**** Directives created by AutoIt3Wrapper_GUI ****\n#EndRegion\n",
+        );
+        assert_eq!(syms[0].name, "**** Directives created by AutoIt3Wrapper_GUI ****");
+    }
+
+    #[test]
+    fn region_with_only_comment_marker_falls_back() {
+        let syms = symbols_for("#Region ;\nGlobal $a = 1\n#EndRegion\n");
+        assert_eq!(syms[0].name, "(region)");
     }
 
     #[test]
