@@ -13,7 +13,7 @@
 //! distinctly (typically dimmed/italic).  `padding_right = true` adds a
 //! thin space between the label and the value it annotates.
 
-use tower_lsp::lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, Range};
+use tower_lsp::lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, Position, Range};
 use tree_sitter::{Node, Tree};
 
 use crate::builtins;
@@ -61,7 +61,7 @@ fn collect_hints(
     out: &mut Vec<InlayHint>,
 ) {
     if node.kind() == "call_expression" {
-        hints_for_call(node, source, file_index, workspace, out);
+        hints_for_call(node, source, range, file_index, workspace, out);
     }
 
     let mut cursor = node.walk();
@@ -83,6 +83,7 @@ fn collect_hints(
 fn hints_for_call(
     call_node: Node,
     source: &str,
+    range: &Range,
     file_index: Option<&FileIndex>,
     workspace: Option<&WorkspaceIndex>,
     out: &mut Vec<InlayHint>,
@@ -121,8 +122,14 @@ fn hints_for_call(
     }
 
     // Emit one hint per argument, stopping at whichever list is shorter.
+    // A multi-line call can straddle the requested range; editors that fetch
+    // hints per row-chunk (Zed: 50 rows) treat a response as owning exactly
+    // that range, so out-of-range hints would duplicate across chunks.
     for (arg_node, param_name) in args.iter().zip(param_names.iter()) {
         let pos = byte_to_position(source, arg_node.start_byte());
+        if !position_in_range(pos, range) {
+            continue;
+        }
         out.push(InlayHint {
             position: pos,
             label: InlayHintLabel::String(format!("{param_name}:")),
@@ -134,6 +141,13 @@ fn hints_for_call(
             data: None,
         });
     }
+}
+
+/// LSP ranges are end-exclusive.
+fn position_in_range(pos: Position, range: &Range) -> bool {
+    let at_or_after_start = (pos.line, pos.character) >= (range.start.line, range.start.character);
+    let before_end = (pos.line, pos.character) < (range.end.line, range.end.character);
+    at_or_after_start && before_end
 }
 
 // ─── Parameter name lookup ────────────────────────────────────────────────────
@@ -178,7 +192,6 @@ mod tests {
     use super::*;
     use crate::index::build_index;
     use crate::tree::parse;
-    use tower_lsp::lsp_types::Position;
 
     fn all_lines() -> Range {
         Range {
@@ -346,5 +359,35 @@ mod tests {
         for h in &hints {
             assert_eq!(h.position.line, 0, "only line-0 hints expected");
         }
+    }
+
+    #[test]
+    fn multiline_call_straddling_chunks_splits_hints_by_range() {
+        // Mirrors Zed's 50-row chunked requests: a call whose arguments span a
+        // chunk boundary must emit each hint in exactly one chunk.
+        let source = concat!(
+            "MsgBox(0, \"a\" & _\n",
+            "\"b\" & _\n",
+            "\"c\", \"text\")\n",
+            "ConsoleWrite(\"d\")\n",
+        );
+        let tree = parse(source).unwrap();
+        let first = Range {
+            start: Position::new(0, 0),
+            end: Position::new(2, 0),
+        };
+        let second = Range {
+            start: Position::new(2, 0),
+            end: Position::new(4, 0),
+        };
+        let first_hints = inlay_hints_for(&tree, source, first, None, None);
+        let second_hints = inlay_hints_for(&tree, source, second, None, None);
+
+        assert_eq!(labels(&first_hints), vec!["flag:", "title:"]);
+        assert!(first_hints.iter().all(|h| h.position.line < 2));
+        assert!(second_hints.iter().all(|h| h.position.line >= 2));
+        let second_labels = labels(&second_hints);
+        assert_eq!(second_labels.first().map(String::as_str), Some("text:"));
+        assert_eq!(second_labels.len(), 2, "MsgBox text + ConsoleWrite data");
     }
 }
